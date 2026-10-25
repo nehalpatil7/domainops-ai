@@ -22,6 +22,17 @@ describe("Worker entry point", () => {
     expect(response.status).toBe(404);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "ROUTE_NOT_FOUND" } });
   });
+
+  it("routes the workspace chat agent and initializes persistent message storage", async () => {
+    const workspace = uniqueWorkspace("chat");
+    const response = await worker.fetch(
+      new Request(`https://domainops.test/agents/domain-ops-chat-agent/${workspace}/get-messages`),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    await expect(response.json()).resolves.toEqual([]);
+  });
 });
 
 describe("workspace domain API", () => {

@@ -1,19 +1,22 @@
-# Domain management architecture
+# DomainOps AI architecture
 
 ## Scope
 
-This increment is the deterministic domain-management foundation for DomainOps AI. It deliberately excludes AI so domain state and retry behavior can be tested independently. Cloudflare for SaaS responses are simulated; storage and orchestration use the real Cloudflare development primitives.
+DomainOps AI combines a deterministic domain-management control plane with a stateful troubleshooting assistant. Cloudflare for SaaS responses are simulated; storage, orchestration, chat persistence, and model inference use Cloudflare platform primitives.
 
 ## Components and request flow
 
 ```text
 React dashboard
-      |
-      | workspace-scoped REST API
-      v
-Worker API handler
-      |
-      | idFromName(workspaceId) + RPC
+      |                                      |
+      | workspace REST API                   | useAgentChat WebSocket
+      v                                      v
+Worker API handler                    DomainOpsChatAgent
+      |                               SQLite chat history
+      | idFromName(workspaceId)              |
+      |                                      +-- Workers AI / Llama 3.3
+      |                                      |
+      |<----------- read-only tool RPC ------+
       v
 WorkspaceDomainStore (one SQLite Durable Object per workspace)
       |
@@ -29,11 +32,32 @@ WorkspaceDomainStore (one SQLite Durable Object per workspace)
 
 HTTP handlers only parse routes and bodies, select the workspace Durable Object, start Workflows, and produce consistent envelopes. Business rules live in `DomainService`; persistence details live in `DomainRepository`; deterministic provider behavior lives in `simulation.ts`.
 
+The chat Durable Object is separate from domain storage. This lets `AIChatAgent` own its SQLite message and resumable-stream tables while every factual tool result still comes from `WorkspaceDomainStore` through RPC.
+
+## AI grounding and conversation memory
+
+The browser names the Agent instance with the current workspace ID. That gives each workspace a persistent transcript and prevents chat history from being shared between workspaces. `AIChatAgent` persists messages automatically, and the complete recent conversation—including the previous domain and follow-up question—is converted to model messages on each turn.
+
+The assistant uses `@cf/meta/llama-3.3-70b-instruct-fp8-fast` through the Workers AI binding and Cloudflare's AI SDK provider. The first step has `toolChoice: "required"`; later steps may call additional tools or produce the answer. A bounded six-step loop prevents runaway tool calls.
+
+Grounding is enforced at multiple layers:
+
+1. The system prompt says backend tools are the only source of domain facts.
+2. Every turn must begin with a tool call, including multi-turn follow-ups.
+3. Tools derive the workspace server-side and expose no cross-workspace selector.
+4. Ambiguous, missing, and backend-error results are explicit structured outcomes.
+5. Deterministic diagnosis separates confirmed facts, possible causes, and actions.
+6. There are no mutating tools.
+
+Tool calls return `providerData: "simulation"` so the assistant cannot present them as live DNS or production Cloudflare for SaaS observations.
+
 ## Workspace isolation
 
 The Worker derives a Durable Object ID with `idFromName(workspaceId)`. Each instance has a `workspace_metadata` row that permanently binds it to the first workspace ID it sees. Every domain, event, and idempotency query also includes `workspace_id` as defense in depth.
 
 This is isolation, not authentication. A production API must derive the workspace from authenticated identity instead of accepting it directly from the URL.
+
+The same limitation currently applies to Agent instance names. Authentication must bind both REST and chat routes to an authorized workspace before production use.
 
 ## SQLite model
 

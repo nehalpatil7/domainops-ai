@@ -1,8 +1,8 @@
 # DomainOps AI
 
-DomainOps AI is a Cloudflare-native reference application for custom-domain onboarding and troubleshooting. This increment implements the domain management control plane; AI assistance is intentionally deferred.
+DomainOps AI is a Cloudflare-native reference application for custom-domain onboarding and AI-assisted troubleshooting.
 
-The application uses real Cloudflare Workers, SQLite-backed Durable Objects, and Workflows. DNS, custom-hostname, and certificate provider results are deterministic simulations, clearly labeled as such in the API and dashboard. It is an independent implementation based on public Cloudflare documentation and is not connected to HubSpot systems, data, or source code.
+The application uses real Cloudflare Workers, SQLite-backed Durable Objects, Workflows, the Agents SDK, and Workers AI. DNS, custom-hostname, and certificate provider results are deterministic simulations, clearly labeled as such in the API, tools, and dashboard. It is an independent implementation based on public Cloudflare documentation and is not connected to HubSpot systems, data, or source code.
 
 ## Included now
 
@@ -15,6 +15,9 @@ The application uses real Cloudflare Workers, SQLite-backed Durable Objects, and
 - Idempotent registration and revalidation mutations
 - Four seeded examples per demo workspace: active, incorrect DNS, pending SSL, and validation failure
 - React dashboard for registration, inspection, and retries
+- Persistent, streaming `AIChatAgent` conversations scoped to each workspace
+- Read-only backend tools for inventory, status, DNS/SSL details, history, and deterministic diagnosis
+- Workers AI inference with `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
 
 ## Stack
 
@@ -22,6 +25,8 @@ The application uses real Cloudflare Workers, SQLite-backed Durable Objects, and
 - Cloudflare Workers and Static Assets
 - SQLite-backed Durable Objects
 - Cloudflare Workflows
+- Cloudflare Agents SDK, `AIChatAgent`, and `useAgentChat`
+- Workers AI and Llama 3.3 70B Instruct FP8 Fast
 - Vite, Wrangler, and Cloudflare's Vitest integration
 
 ## Get started
@@ -31,10 +36,11 @@ Prerequisites are Node.js 22 or newer and npm.
 ```bash
 npm install
 npm run types
+npx wrangler login
 npm run dev
 ```
 
-Open `http://localhost:5173`. The Durable Object and Workflow both run in the local Cloudflare runtime. No Cloudflare account or production Cloudflare for SaaS configuration is required for local development.
+Open `http://localhost:5173`. The Durable Objects and Workflow run in the local Cloudflare runtime. Domain management needs no production Cloudflare for SaaS configuration. Chat inference uses the remote Workers AI binding because there is no local model emulator, so Wrangler authentication is required to start the complete application.
 
 Run the full quality gate:
 
@@ -85,15 +91,33 @@ Hostname and SSL status are stored independently. A domain is ready only when:
 
 SSL values mirror useful Cloudflare for SaaS concepts such as `pending_validation`, `pending_issuance`, `pending_deployment`, `active`, and timeout/failure states. They are simulated here and do not represent a live Cloudflare zone.
 
+## AI assistant
+
+Each workspace connects to its own `DomainOpsChatAgent` Durable Object. `AIChatAgent` stores the multi-turn transcript in SQLite and `useAgentChat` provides WebSocket streaming, reconnection, and history loading.
+
+The model has five server-side tools:
+
+- `listDomains`
+- `getDomainStatus`
+- `getDnsConfiguration`
+- `getValidationHistory`
+- `diagnoseDomain`
+
+The first model step of every turn must call a tool. Tool inputs never accept a workspace ID; the server derives the workspace from the Agent instance name and calls the existing `WorkspaceDomainStore`. Ambiguous matches return candidates and instruct the assistant to ask for clarification. Not-found and backend-error results explicitly prohibit inferred state. `diagnoseDomain` separates confirmed blockers from possible causes and recommended actions.
+
+All five tools are read-only. Registration and revalidation remain dashboard/API operations and are not available to the model.
+
 ## Project structure
 
 ```text
 src/
+  agent/            AIChatAgent and read-only backend tools
   api/              HTTP routing and response envelopes
   domain/           Validation, simulator, repository, and domain service
   durable-object/   WorkspaceDomainStore RPC boundary
   workflows/        Durable revalidation orchestration
   app.tsx           React domain dashboard
+  chat-panel.tsx    Persistent streaming chat UI
   server.ts         Worker entry point
 docs/
   architecture.md
@@ -108,7 +132,7 @@ See [docs/architecture.md](docs/architecture.md) for persistence, request flow, 
 - Demo workspace IDs are supplied by the client. Authentication and authorization must be added before production use.
 - Internationalized hostnames are not converted with IDNA; inputs must be ASCII hostnames.
 - There is no cross-workspace aggregate index because Durable Object SQLite is instance-local.
-- AI and Workers AI bindings are deliberately absent from this backend increment.
+- Local chat requires Cloudflare authentication because Workers AI inference is remote.
 
 ## Relevant Cloudflare documentation
 
@@ -118,3 +142,6 @@ See [docs/architecture.md](docs/architecture.md) for persistence, request flow, 
 - [Cloudflare for SaaS custom hostnames](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/domain-support/)
 - [Cloudflare for SaaS common API calls](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/start/common-api-calls/)
 - [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
+- [Cloudflare Agents](https://developers.cloudflare.com/agents/)
+- [`AIChatAgent` and `useAgentChat`](https://developers.cloudflare.com/agents/communication-channels/chat/chat-agents/)
+- [Llama 3.3 70B Instruct FP8 Fast](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)

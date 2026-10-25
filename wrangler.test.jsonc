@@ -11,12 +11,20 @@
         "name": "WorkspaceDomainStore",
         "class_name": "WorkspaceDomainStore",
       },
+      {
+        "name": "DomainOpsChatAgent",
+        "class_name": "DomainOpsChatAgent",
+      },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["WorkspaceDomainStore"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["DomainOpsChatAgent"],
     },
   ],
   "workflows": [

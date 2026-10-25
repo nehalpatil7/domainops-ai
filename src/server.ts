@@ -1,5 +1,7 @@
+import { routeAgentRequest } from "agents";
 import { handleDomainApi } from "./api/domain-api";
 
+export { DomainOpsChatAgent } from "./agent/domain-ops-chat-agent";
 export { WorkspaceDomainStore } from "./durable-object/workspace-domain-store";
 export { DomainRevalidationWorkflow } from "./workflows/domain-revalidation-workflow";
 
@@ -17,6 +19,11 @@ export default {
 
     if (url.pathname.startsWith("/api/workspaces/")) {
       return handleDomainApi(request, env);
+    }
+
+    if (url.pathname.startsWith("/agents/")) {
+      const agentResponse = await routeAgentRequest(request, env);
+      if (agentResponse) return agentResponse;
     }
 
     return Response.json(

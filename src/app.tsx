@@ -6,6 +6,7 @@ import {
   type Domain,
   type SimulationProfile,
 } from "./domain/types";
+import { ChatPanel } from "./chat-panel";
 
 type ApiEnvelope<T> = {
   data: T;
@@ -200,70 +201,73 @@ export default function App() {
           </section>
         </div>
 
-        <section className="panel detail-panel">
-          <div className="panel-heading">
-            <div>
-              <span>Domain details</span>
-              <h2>{selected?.hostname ?? "Select a domain"}</h2>
-            </div>
-            {selected ? (
-              <button
-                className="primary"
-                disabled={busy || Boolean(selected.activeValidationId)}
-                onClick={() => void revalidate(selected)}
-              >
-                {selected.activeValidationId ? "Validating…" : "Revalidate"}
-              </button>
-            ) : null}
-          </div>
-          {selected && assessment ? (
-            <div className="details">
-              <div className="facts">
-                <Fact name="Validation" value={selected.validationState} />
-                <Fact name="Retries" value={String(selected.retryCount)} />
-                <Fact
-                  name="Last attempt"
-                  value={
-                    selected.lastValidationAttemptAt
-                      ? formatTime(selected.lastValidationAttemptAt)
-                      : "Never"
-                  }
-                />
-                <Fact name="Source" value="Simulation" />
+        <div className="right-column">
+          <section className="panel detail-panel">
+            <div className="panel-heading">
+              <div>
+                <span>Domain details</span>
+                <h2>{selected?.hostname ?? "Select a domain"}</h2>
               </div>
-              <h3>DNS configuration</h3>
-              <RecordList title="Expected" records={assessment.expectedRecords} />
-              <RecordList title="Observed" records={assessment.observedRecords} />
-              <h3>Required validation records</h3>
-              <ul className="records">
-                {assessment.requiredValidationRecords.map((record) => (
-                  <li key={record.purpose}>
-                    <code>
-                      {record.type} {record.name} → {record.value}
-                    </code>
-                    <span>{record.status}</span>
-                  </li>
-                ))}
-              </ul>
-              <h3>Diagnostic history</h3>
-              <ol className="history">
-                {history.map((item) => (
-                  <li key={item.id}>
-                    <b>{item.diagnosticCode}</b>
-                    <p>{item.message}</p>
-                    <small>
-                      {item.category} · {formatTime(item.createdAt)}
-                    </small>
-                  </li>
-                ))}
-              </ol>
+              {selected ? (
+                <button
+                  className="primary"
+                  disabled={busy || Boolean(selected.activeValidationId)}
+                  onClick={() => void revalidate(selected)}
+                >
+                  {selected.activeValidationId ? "Validating…" : "Revalidate"}
+                </button>
+              ) : null}
             </div>
-          ) : (
-            <div className="empty">
-              Choose a domain to inspect its configuration and event history.
-            </div>
-          )}
-        </section>
+            {selected && assessment ? (
+              <div className="details">
+                <div className="facts">
+                  <Fact name="Validation" value={selected.validationState} />
+                  <Fact name="Retries" value={String(selected.retryCount)} />
+                  <Fact
+                    name="Last attempt"
+                    value={
+                      selected.lastValidationAttemptAt
+                        ? formatTime(selected.lastValidationAttemptAt)
+                        : "Never"
+                    }
+                  />
+                  <Fact name="Source" value="Simulation" />
+                </div>
+                <h3>DNS configuration</h3>
+                <RecordList title="Expected" records={assessment.expectedRecords} />
+                <RecordList title="Observed" records={assessment.observedRecords} />
+                <h3>Required validation records</h3>
+                <ul className="records">
+                  {assessment.requiredValidationRecords.map((record) => (
+                    <li key={record.purpose}>
+                      <code>
+                        {record.type} {record.name} → {record.value}
+                      </code>
+                      <span>{record.status}</span>
+                    </li>
+                  ))}
+                </ul>
+                <h3>Diagnostic history</h3>
+                <ol className="history">
+                  {history.map((item) => (
+                    <li key={item.id}>
+                      <b>{item.diagnosticCode}</b>
+                      <p>{item.message}</p>
+                      <small>
+                        {item.category} · {formatTime(item.createdAt)}
+                      </small>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ) : (
+              <div className="empty">
+                Choose a domain to inspect its configuration and event history.
+              </div>
+            )}
+          </section>
+          <ChatPanel key={workspaceId} workspaceId={workspaceId} />
+        </div>
       </section>
     </main>
   );

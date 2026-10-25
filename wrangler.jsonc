@@ -6,10 +6,14 @@
   "compatibility_flags": ["nodejs_compat"],
   "keep_names": true,
   "upload_source_maps": true,
+  "ai": {
+    "binding": "AI",
+    "remote": true,
+  },
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"],
+    "run_worker_first": ["/agents/*", "/api/*"],
   },
   "durable_objects": {
     "bindings": [
@@ -17,12 +21,20 @@
         "name": "WorkspaceDomainStore",
         "class_name": "WorkspaceDomainStore",
       },
+      {
+        "name": "DomainOpsChatAgent",
+        "class_name": "DomainOpsChatAgent",
+      },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["WorkspaceDomainStore"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["DomainOpsChatAgent"],
     },
   ],
   "workflows": [
