@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "domainops-ai",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-10-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "keep_names": true,
+  "upload_source_maps": true,
+  "ai": {
+    "binding": "AI",
+    "remote": true,
+  },
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*", "/api/*"],
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DomainOpsAgent",
+        "class_name": "DomainOpsAgent",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DomainOpsAgent"],
+    },
+  ],
+  "workflows": [
+    {
+      "name": "domain-validation-workflow",
+      "binding": "DOMAIN_VALIDATION_WORKFLOW",
+      "class_name": "DomainValidationWorkflow",
+    },
+  ],
+  "observability": {
+    "enabled": true,
+  },
+}

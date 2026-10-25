@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "domainops-ai-test",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-10-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "keep_names": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DomainOpsAgent",
+        "class_name": "DomainOpsAgent",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DomainOpsAgent"],
+    },
+  ],
+  "workflows": [
+    {
+      "name": "domain-validation-workflow-test",
+      "binding": "DOMAIN_VALIDATION_WORKFLOW",
+      "class_name": "DomainValidationWorkflow",
+    },
+  ],
+}
