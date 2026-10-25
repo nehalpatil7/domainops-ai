@@ -1,65 +1,153 @@
-export const simulationScenarios = [
-  "healthy",
-  "missing_cname",
-  "pending_hostname",
-  "certificate_error",
+export const simulationProfiles = [
+  "active",
+  "incorrect_dns",
+  "pending_ssl",
+  "validation_failure",
 ] as const;
 
-export type SimulationScenario = (typeof simulationScenarios)[number];
+export type SimulationProfile = (typeof simulationProfiles)[number];
 export type DnsStatus = "pending" | "valid" | "invalid";
-export type HostnameStatus = "pending" | "active" | "error";
-export type CertificateStatus = "pending" | "active" | "error";
-export type ValidationPhase = "dns" | "hostname" | "certificate";
+export type HostnameStatus = "pending" | "active" | "blocked" | "moved" | "deleted";
+export type SslStatus =
+  | "initializing"
+  | "pending_validation"
+  | "pending_issuance"
+  | "pending_deployment"
+  | "active"
+  | "validation_timed_out"
+  | "issuance_timed_out"
+  | "deployment_timed_out"
+  | "failed";
+export type ValidationState =
+  | "pending"
+  | "checking"
+  | "dns_misconfigured"
+  | "pending_hostname"
+  | "pending_ssl"
+  | "active"
+  | "failed";
 
-export type DomainStatuses = {
-  dnsStatus: DnsStatus;
-  hostnameStatus: HostnameStatus;
-  certificateStatus: CertificateStatus;
+export type DnsRecord = {
+  type: "CNAME" | "TXT";
+  name: string;
+  value: string;
+  ttl: number;
 };
 
-export type DomainRecord = DomainStatuses & {
+export type ValidationRecord = {
+  purpose: "hostname_ownership" | "certificate";
+  type: "TXT" | "HTTP";
+  name: string;
+  value: string;
+  status: "pending" | "valid" | "failed";
+};
+
+export type Domain = {
   id: string;
+  workspaceId: string;
   hostname: string;
-  scenario: SimulationScenario;
-  activeWorkflowId: string | null;
+  expectedDnsTarget: string;
+  expectedDnsRecords: DnsRecord[];
+  observedDnsRecords: DnsRecord[];
+  dnsStatus: DnsStatus;
+  hostnameStatus: HostnameStatus;
+  sslStatus: SslStatus;
+  requiredValidationRecords: ValidationRecord[];
+  validationState: ValidationState;
   source: "simulation";
+  simulationProfile: SimulationProfile;
   createdAt: string;
   updatedAt: string;
-  lastCheckedAt: string | null;
+  lastValidationAttemptAt: string | null;
+  retryCount: number;
+  lastAppliedAttempt: number;
+  activeValidationId: string | null;
   ready: boolean;
 };
 
-export type DomainStatusEvent = {
+export type DiagnosticEvent = {
   id: string;
+  workspaceId: string;
   domainId: string;
-  category: "dns" | "hostname" | "certificate" | "workflow";
-  previousStatus: string | null;
-  nextStatus: string;
-  reason: string;
+  eventType:
+    | "domain_registered"
+    | "validation_started"
+    | "status_changed"
+    | "validation_completed"
+    | "validation_failed";
+  category: "domain" | "dns" | "hostname" | "ssl" | "validation" | "workflow";
+  previousValue: string | null;
+  nextValue: string | null;
+  diagnosticCode: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  validationId: string | null;
+  attempt: number | null;
   source: "simulation" | "system" | "user";
-  workflowId: string | null;
   createdAt: string;
 };
 
 export type RegisterDomainInput = {
   hostname: string;
-  scenario: SimulationScenario;
+  expectedDnsTarget?: string;
+  observedDnsRecord?: string | null;
+  simulationProfile?: SimulationProfile;
 };
 
-export type DomainInspection = {
-  domain: DomainRecord;
-  history: DomainStatusEvent[];
+export type RegisterDomainResult = {
+  domain: Domain;
+  duplicate: boolean;
 };
 
-export type WorkflowProgress = {
+export type DnsAssessment = {
+  domainId: string;
+  hostname: string;
+  source: "simulation";
+  expectedRecords: DnsRecord[];
+  observedRecords: DnsRecord[];
+  matchingRecords: DnsRecord[];
+  missingRecords: DnsRecord[];
+  unexpectedRecords: DnsRecord[];
+  requiredValidationRecords: ValidationRecord[];
+  dnsStatus: DnsStatus;
+  hostnameStatus: HostnameStatus;
+  sslStatus: SslStatus;
+  validationState: ValidationState;
+  ready: boolean;
+};
+
+export type BeginRevalidationResult = {
+  domain: Domain;
   workflowId: string;
-  status: "running" | "complete" | "error";
-  step: string;
-  message: string;
-  percent: number;
+  attempt: number;
+  duplicate: boolean;
+  shouldStart: boolean;
 };
 
-export type DomainOpsState = {
-  revision: number;
-  workflowProgress: Record<string, WorkflowProgress>;
+export type RevalidationOutcome = {
+  dnsStatus: DnsStatus;
+  hostnameStatus: HostnameStatus;
+  sslStatus: SslStatus;
+  validationState: ValidationState;
+  requiredValidationRecords: ValidationRecord[];
+  diagnosticCode: string;
+  message: string;
 };
+
+export type RevalidationWorkflowParams = {
+  workspaceId: string;
+  domainId: string;
+  workflowId: string;
+  attempt: number;
+  profile: SimulationProfile;
+  hostname: string;
+};
+
+export type BackendErrorPayload = {
+  code: string;
+  message: string;
+  status: number;
+  details?: Record<string, string | number | boolean | string[] | null>;
+};
+
+export type BackendResult<T> = { ok: true; value: T } | { ok: false; error: BackendErrorPayload };

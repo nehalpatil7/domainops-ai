@@ -1,105 +1,120 @@
 # DomainOps AI
 
-DomainOps AI is a Cloudflare-native reference application for custom-domain onboarding and troubleshooting. It combines a React dashboard with a stateful AI assistant, durable validation workflows, and SQLite-backed history.
+DomainOps AI is a Cloudflare-native reference application for custom-domain onboarding and troubleshooting. This increment implements the domain management control plane; AI assistance is intentionally deferred.
 
-The first version intentionally uses deterministic simulated DNS, hostname, and certificate results. The AI, Durable Object persistence, WebSocket communication, and Workflow execution use the real Cloudflare developer platform.
+The application uses real Cloudflare Workers, SQLite-backed Durable Objects, and Workflows. DNS, custom-hostname, and certificate provider results are deterministic simulations, clearly labeled as such in the API and dashboard. It is an independent implementation based on public Cloudflare documentation and is not connected to HubSpot systems, data, or source code.
+
+## Included now
+
+- Workspace-isolated domain registration and inventory
+- Expected and observed DNS records
+- Independent hostname activation and SSL certificate statuses
+- Required hostname ownership and certificate validation records
+- Deterministic revalidation through Cloudflare Workflows
+- SQLite-backed status, retry, timestamp, and diagnostic event history
+- Idempotent registration and revalidation mutations
+- Four seeded examples per demo workspace: active, incorrect DNS, pending SSL, and validation failure
+- React dashboard for registration, inspection, and retries
 
 ## Stack
 
 - TypeScript and React 19
 - Cloudflare Workers and Static Assets
-- Cloudflare Agents SDK with `AIChatAgent` and `useAgentChat`
-- Workers AI with `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
 - SQLite-backed Durable Objects
 - Cloudflare Workflows
-- Vite, Wrangler, and the Cloudflare Vitest integration
-
-## What is included
-
-- Register simulated custom domains from the dashboard.
-- Track DNS, hostname activation, and certificate status.
-- Preserve an immutable status-change history in Durable Object SQLite.
-- Run deterministic validation scenarios through a real Cloudflare Workflow.
-- Ask an AI assistant to list or inspect domains and request validation retries.
-- Persist and resume chat history through `AIChatAgent`.
-
-This is an independent implementation based on Cloudflare's public documentation. It is not connected to HubSpot systems, data, or source code.
+- Vite, Wrangler, and Cloudflare's Vitest integration
 
 ## Get started
 
-Prerequisites:
-
-- Node.js 22 or newer
-- A Cloudflare account
-- Wrangler authentication via `npx wrangler login` or `CLOUDFLARE_API_TOKEN`
-
-Install and generate binding types:
+Prerequisites are Node.js 22 or newer and npm.
 
 ```bash
 npm install
 npm run types
-```
-
-Start local development:
-
-```bash
 npm run dev
 ```
 
-Open `http://localhost:5173`. Durable Objects and Workflows run locally. Workers AI has no local simulator, so chat inference uses the remote `AI` binding and requires Cloudflare authentication.
+Open `http://localhost:5173`. The Durable Object and Workflow both run in the local Cloudflare runtime. No Cloudflare account or production Cloudflare for SaaS configuration is required for local development.
 
-Run validation:
+Run the full quality gate:
 
 ```bash
 npm run check
 ```
 
-Deploy:
+Deploy after authenticating Wrangler:
 
 ```bash
 npm run deploy
 ```
 
-## Simulation scenarios
+## API
 
-Registration accepts one of four reproducible scenarios:
+All domain responses include `meta.simulated: true`. Replace `:workspaceId` with a lowercase demo workspace ID and `:domainId` with a returned UUID.
 
-- `healthy`: DNS, hostname activation, and certificate issuance succeed.
-- `missing_cname`: DNS validation fails because the expected CNAME is absent.
-- `pending_hostname`: DNS succeeds while hostname activation remains pending.
-- `certificate_error`: DNS and hostname activation succeed, then certificate issuance fails.
+| Method | Route                                                       | Purpose                                                            |
+| ------ | ----------------------------------------------------------- | ------------------------------------------------------------------ |
+| `GET`  | `/api/workspaces/:workspaceId/domains`                      | List domains                                                       |
+| `POST` | `/api/workspaces/:workspaceId/domains`                      | Register a domain                                                  |
+| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId`            | Get current domain state                                           |
+| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId/dns`        | Compare expected and observed DNS and show validation requirements |
+| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId/history`    | List diagnostic and status events                                  |
+| `POST` | `/api/workspaces/:workspaceId/domains/:domainId/revalidate` | Start a durable revalidation                                       |
 
-Every simulated result is labeled `simulation` in stored records and the UI. A future production adapter can implement the same provider boundary using Cloudflare for SaaS APIs.
+Mutation requests require an `Idempotency-Key` header with 8–128 URL-safe characters. Registration also requires `Content-Type: application/json`:
+
+```json
+{
+  "hostname": "app.customer.example",
+  "expectedDnsTarget": "customers.domainops.example",
+  "observedDnsRecord": "customers.domainops.example",
+  "simulationProfile": "pending_ssl"
+}
+```
+
+Supported profiles are `active`, `incorrect_dns`, `pending_ssl`, and `validation_failure`. Omitting a profile defaults to `pending_ssl`. Replaying an identical mutation with the same idempotency key returns its existing result without creating another transition or event. Reusing the key for different input returns `409 IDEMPOTENCY_KEY_REUSED`.
+
+## Readiness and status semantics
+
+Hostname and SSL status are stored independently. A domain is ready only when:
+
+- DNS status is `valid`;
+- hostname status is `active`;
+- SSL status is `active`; and
+- validation state is `active`.
+
+SSL values mirror useful Cloudflare for SaaS concepts such as `pending_validation`, `pending_issuance`, `pending_deployment`, `active`, and timeout/failure states. They are simulated here and do not represent a live Cloudflare zone.
 
 ## Project structure
 
 ```text
 src/
-  agent/       Stateful AI agent and SQLite repository boundary
-  domain/      Domain types, hostname validation, and simulator
-  workflows/   Durable validation workflow
-  app.tsx      React dashboard and chat
-  client.tsx   Browser entry point
-  server.ts    Worker entry point and Agent routing
+  api/              HTTP routing and response envelopes
+  domain/           Validation, simulator, repository, and domain service
+  durable-object/   WorkspaceDomainStore RPC boundary
+  workflows/        Durable revalidation orchestration
+  app.tsx           React domain dashboard
+  server.ts         Worker entry point
 docs/
   architecture.md
 test/
 ```
 
-See [docs/architecture.md](docs/architecture.md) for component responsibilities, data flow, and current constraints.
+See [docs/architecture.md](docs/architecture.md) for persistence, request flow, and implementation constraints.
 
 ## Current limitations
 
-- Domain and certificate checks are simulated; no Cloudflare for SaaS API calls are made.
-- The demo uses one Agent instance named `demo`. Production must derive the Agent name from authenticated tenant identity.
-- Workers AI calls are excluded from automated tests because inference is remote.
-- Llama 3.3 is configurable in code, but workflow correctness never depends on model output.
+- Provider checks are simulations; no Cloudflare for SaaS API is called.
+- Demo workspace IDs are supplied by the client. Authentication and authorization must be added before production use.
+- Internationalized hostnames are not converted with IDNA; inputs must be ASCII hostnames.
+- There is no cross-workspace aggregate index because Durable Object SQLite is instance-local.
+- AI and Workers AI bindings are deliberately absent from this backend increment.
 
-## Useful documentation
+## Relevant Cloudflare documentation
 
-- [Cloudflare Agents](https://developers.cloudflare.com/agents/)
-- [`AIChatAgent` and `useAgentChat`](https://developers.cloudflare.com/agents/communication-channels/chat/chat-agents/)
-- [Agent state](https://developers.cloudflare.com/agents/runtime/lifecycle/state/)
-- [Agents with Workflows](https://developers.cloudflare.com/agents/concepts/workflows/)
-- [Workers AI model](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)
+- [Durable Objects](https://developers.cloudflare.com/durable-objects/)
+- [SQLite-backed Durable Objects](https://developers.cloudflare.com/durable-objects/api/sql-storage/)
+- [Cloudflare Workflows](https://developers.cloudflare.com/workflows/)
+- [Cloudflare for SaaS custom hostnames](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/domain-support/)
 - [Cloudflare for SaaS common API calls](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/start/common-api-calls/)
+- [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)

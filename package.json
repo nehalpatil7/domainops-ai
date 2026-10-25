@@ -2,7 +2,7 @@
   "name": "domainops-ai",
   "version": "0.1.0",
   "private": true,
-  "description": "AI-powered custom domain onboarding and troubleshooting on Cloudflare",
+  "description": "Custom domain onboarding and troubleshooting backend on Cloudflare",
   "type": "module",
   "scripts": {
     "build": "vite build",
@@ -18,14 +18,8 @@
     "types": "wrangler types env.d.ts"
   },
   "dependencies": {
-    "@ai-sdk/provider": "^4.0.34",
-    "@ai-sdk/react": "^4.0.157",
-    "@cloudflare/ai-chat": "^0.12.2",
-    "agents": "^0.30.1",
-    "ai": "^7.0.153",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "zod": "^4.6.7"
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.65.0",
