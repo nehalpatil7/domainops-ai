@@ -284,7 +284,7 @@ export function compareRuns(
 function dnsRecordValues(query: LiveDiagnosticRun["dns"][number] | undefined): string {
   return (query?.records ?? [])
     .filter((record) => record.type === query?.type)
-    .map((record) => `${record.name}=${record.value}`)
+    .map((record) => `${record.name}=${record.value} (TTL ${record.ttl})`)
     .sort()
     .join(", ");
 }

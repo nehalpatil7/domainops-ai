@@ -180,7 +180,16 @@ async function resolveCnameChain(
         chain,
         error: `CNAME chain exceeds the ${maxCnameDepth}-hop safety limit.`,
       };
-    const target = validateLiveHostname(targets[0]);
+    let target: string;
+    try {
+      target = validateLiveHostname(targets[0]);
+    } catch {
+      return {
+        addresses: [],
+        chain,
+        error: `CNAME target ${targets[0]} is not a permitted public hostname.`,
+      };
+    }
     chain.push({ from: current, to: target, depth: depth + 1 });
     current = target;
   }

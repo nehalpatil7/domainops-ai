@@ -23,6 +23,9 @@ export class WorkspaceCatalog extends DurableObject<Env> {
     if (!columns.some((column) => column.name === "owner_id"))
       this.sql.exec("ALTER TABLE workspaces ADD COLUMN owner_id TEXT");
     this.sql.exec("CREATE INDEX IF NOT EXISTS workspaces_by_owner ON workspaces(owner_id, name)");
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS workspaces_require_owner
+      BEFORE INSERT ON workspaces WHEN NEW.owner_id IS NULL OR length(NEW.owner_id) < 1
+      BEGIN SELECT RAISE(ABORT, 'workspace owner is required'); END`);
   }
 
   list(ownerId: string): BackendResult<Workspace[]> {
@@ -91,7 +94,23 @@ export class WorkspaceCatalog extends DurableObject<Env> {
     });
   }
   authorize(ownerId: string, idValue: string): BackendResult<Workspace> {
-    return this.ensure(ownerId, idValue);
+    return this.run(() => {
+      const id = validateWorkspaceId(idValue);
+      const existing = [
+        ...this.sql.exec<WorkspaceRow>(
+          "SELECT * FROM workspaces WHERE id = ? AND owner_id = ?",
+          id,
+          ownerId,
+        ),
+      ][0];
+      if (!existing)
+        throw new DomainError(
+          "WORKSPACE_FORBIDDEN",
+          "You do not have access to this workspace.",
+          403,
+        );
+      return toWorkspace(existing);
+    });
   }
   rename(ownerId: string, idValue: string, nameValue: unknown): BackendResult<Workspace> {
     return this.run(() => {

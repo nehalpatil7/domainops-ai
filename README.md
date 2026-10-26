@@ -23,7 +23,21 @@ npx wrangler login
 npm run dev
 ```
 
-Run the quality gate with `npm run check`; deploy with `npm run deploy`.
+Run the quality gate with `npm run check`.
+
+### Authentication before deployment
+
+Production API and Agent routes fail closed unless Cloudflare Access is configured. Create an Access self-hosted application covering the entire deployed hostname, then configure these Worker variables:
+
+```text
+AUTH_MODE=cloudflare_access
+CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+CF_ACCESS_AUD=your-access-application-audience-tag
+```
+
+The Worker verifies the Access JWT signature, issuer, audience, expiry, and subject against the team JWKS. Forwarded identity headers alone are not trusted. `localhost`, `127.0.0.1`, and the test host use a fixed development identity; `AUTH_MODE=development` is available for an explicit non-production development deployment and must not be used publicly.
+
+After configuring Access and the variables, deploy with `npm run deploy`.
 
 ## API
 
@@ -40,10 +54,14 @@ All successful responses include `meta.source: "live_public"`. Mutations that re
 | `GET`   | `/api/workspaces/:workspaceId/domains/:domainId/diagnostics` | Get saved checks and changes       |
 | `POST`  | `/api/workspaces/:workspaceId/domains/:domainId/diagnostics` | Run and persist a public check     |
 
-Registration accepts only a hostname:
+Registration accepts a hostname or an HTTP(S) URL. URLs are reduced to their hostname; credentials, custom ports, non-HTTP schemes, IP literals, and reserved/internal hostnames are rejected.
 
 ```json
 { "hostname": "www.example.com" }
+```
+
+```json
+{ "hostname": "https://www.example.com/" }
 ```
 
 Health is derived from the latest immutable diagnostic snapshot:
@@ -55,17 +73,19 @@ Health is derived from the latest immutable diagnostic snapshot:
 
 ## Diagnostics and safety
 
-Each check queries `A`, `AAAA`, `CNAME`, `TXT`, and `CAA` concurrently through Cloudflare DNS over HTTPS. DNS requests time out after three seconds. If every observed address is public, the Worker makes one HTTPS `HEAD` request on port 443 with redirects disabled and a five-second timeout.
+Each check queries `A`, `AAAA`, `CNAME`, `TXT`, and `CAA` through Cloudflare DNS over HTTPS. It follows at most four CNAME hops and records the chain. DNS requests time out after three seconds and `NXDOMAIN` is distinct from resolver errors and empty record sets.
 
-The service rejects reserved/internal hostnames and blocks HTTPS probes when DNS returns private, loopback, link-local, carrier-grade NAT, documentation, multicast, reserved, or unique-local addresses. It permits one active run per domain, caches a completed result for 30 seconds, requires idempotency keys, and retains the newest 50 snapshots.
+The resolver performs a second bounded address/CNAME snapshot immediately before HTTPS. HTTPS is skipped if either snapshot is incomplete, includes a non-public target, exceeds the CNAME bound, or differs from the first snapshot. A permitted target receives an HTTPS `HEAD` request on port 443 with redirects disabled and a five-second timeout. Servers returning `405` or `501` receive one bounded `GET` fallback with `Range: bytes=0-0`; its body is cancelled after headers. Responses are classified as success, redirect, client error, server error, network error, or skipped.
+
+The service rejects reserved/internal hostnames and blocks HTTPS probes when DNS or any CNAME hop returns private, loopback, link-local, carrier-grade NAT, documentation, multicast, reserved, or unique-local addresses. A complete diagnostic is bounded to 34 outbound requests in the worst-case four-hop/HEAD-fallback path. It permits one active run per domain, caches a completed result for 30 seconds, requires idempotency keys, and retains the newest 50 snapshots.
 
 Workers `fetch()` does not expose peer certificate issuer, SAN, serial, or expiry metadata. DomainOps records only whether HTTPS was reachable and whether the TLS handshake succeeded; unavailable certificate metadata is always labeled as such. DNS preflight cannot pin the later request to the observed IP, so Cloudflare runtime outbound restrictions remain an additional SSRF boundary.
 
 ## AI copilot
 
-Each workspace uses a separately named `DomainOpsChatAgent`, so conversation memory does not cross workspaces. The model can list domains, inspect current DNS/HTTPS evidence, review history and changes, and diagnose observed problems. It may run a new public diagnostic only when the user explicitly requests a check or refresh.
+Each workspace uses a separately named `DomainOpsChatAgent`, so conversation memory does not cross workspaces. The model can register domains, list inventory, inspect current DNS/HTTPS evidence, review history and changes, and diagnose observed problems. Registration and a subsequent check can be chained only when the user explicitly requests them; the model may use a domain from recent conversation context.
 
-Every domain-specific response starts with a backend tool. Tool results include observation timestamps and freshness. The prompt requires concise answers separated into observed facts, possible causes, and next steps, and the final model step is text-only so a reply cannot end on an unfinished tool call.
+Tools are used only when domain facts or actions are needed—not for greetings or general explanations. The chat renders every tool name, target, progress, and a compact result; raw JSON stays hidden unless the user asks for it. Tool results can expose safe action buttons, such as registering a missing hostname or running a fresh check. The prompt treats DNS values, HTTP headers, redirects, and tool errors as untrusted data, requires concise observed facts/possible causes/next steps, and reserves later model steps for a complete natural-language answer.
 
 ## Migration from the earlier demo
 
@@ -75,8 +95,8 @@ The global workspace catalog cannot enumerate pre-existing Durable Objects. On f
 
 ## Current limitations
 
-- Authentication and authorization are not implemented; workspace IDs must be bound to authenticated membership before production use.
-- Unicode domains are not converted with IDNA; register ASCII hostnames.
+- Workspace authorization currently supports one owning Access identity per workspace; shared-team membership and ownership transfer are not implemented.
+- Domain storage is ASCII. Standard HTTP(S) URL parsing converts supported internationalized hostnames to punycode; direct hostname input must already be ASCII.
 - Results are point-in-time observations and can differ across resolvers during propagation.
 - TLS certificate metadata is unavailable in the Workers fetch API.
 - Public checks cannot reveal any provider’s internal hostname or certificate lifecycle state.
@@ -90,4 +110,5 @@ See [docs/architecture.md](docs/architecture.md) for component boundaries and mi
 - [Workers AI Llama 3.3 70B](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)
 - [SQLite-backed Durable Objects](https://developers.cloudflare.com/durable-objects/api/sql-storage/)
 - [DNS over HTTPS](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/)
+- [Cloudflare Access JWT validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
 - [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)

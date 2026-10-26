@@ -15,14 +15,25 @@ describe("Worker entry point", () => {
     });
   });
   it("routes isolated persistent chat sessions", async () => {
+    const workspace = workspaceId("chat");
+    await domainRequest(workspace, "");
     const response = await worker.fetch(
-      new Request(
-        `https://domainops.test/agents/domain-ops-chat-agent/${workspaceId("chat")}/get-messages`,
-      ),
+      new Request(`https://domainops.test/agents/domain-ops-chat-agent/${workspace}/get-messages`),
       env,
     );
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual([]);
+  });
+  it("does not let an Agent route create or claim an unknown workspace", async () => {
+    const workspace = workspaceId("unowned-agent");
+    const response = await worker.fetch(
+      new Request(`https://domainops.test/agents/domain-ops-chat-agent/${workspace}/get-messages`),
+      env,
+    );
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "WORKSPACE_FORBIDDEN" },
+    });
   });
   it("fails closed on production hosts when Cloudflare Access is not configured", async () => {
     const response = await worker.fetch(

@@ -149,6 +149,25 @@ describe("live public diagnostics", () => {
       safety: { allowed: true, resolutionStable: true },
     });
   });
+
+  it("records and blocks a CNAME that targets an internal hostname", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.hostname !== "cloudflare-dns.com") throw new Error("HTTPS must not be called");
+      const type = url.searchParams.get("type")!;
+      if (type === "CNAME") return dnsAnswer("CNAME", "alias.public.net", "metadata.internal.");
+      return Response.json({ Status: 0 });
+    });
+    const result = await runLiveDiagnostics("alias.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "failed",
+      safety: {
+        allowed: false,
+        reason: expect.stringContaining("not a permitted public hostname"),
+      },
+      https: { status: "skipped" },
+    });
+  });
 });
 
 describe("live diagnostic network safety", () => {
