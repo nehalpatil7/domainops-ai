@@ -1,3 +1,21 @@
+<div align="center">
+
+# 🌐 DomainOps AI
+
+**AI-powered domain diagnostics and troubleshooting on Cloudflare**
+
+[![Live Demo](https://img.shields.io/badge/🚀_Launch_Live_Demo-Visit_App-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://domainops-ai.nehal-d-patil7.workers.dev)
+
+![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)
+![Workers AI](https://img.shields.io/badge/Workers-AI-blue)
+![Durable Objects](https://img.shields.io/badge/Durable_Objects-SQLite-green)
+
+<p> Access: Authentication is managed through Cloudflare Zero Trust. <br>
+Sign-in requires an authorized email address. Sign-Up can be done using email, SSO or another IAM provider like Google, Apple, etc. </p>
+
+</div>
+
+
 # DomainOps AI
 DomainOps AI is a Cloudflare-native application for monitoring and troubleshooting public domains. It records real public DNS and HTTPS observations, keeps workspace-isolated history, and gives a stateful Workers AI copilot grounded in those results.
 
