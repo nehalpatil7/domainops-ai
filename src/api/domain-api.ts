@@ -5,8 +5,13 @@ import {
   validateWorkspaceId,
 } from "../domain/validation";
 import { runPersistedDiagnostic, unwrap } from "../live/persisted-diagnostic";
+import type { AuthenticatedUser } from "../security/auth";
 
-export async function handleDomainApi(request: Request, env: Env): Promise<Response> {
+export async function handleDomainApi(
+  request: Request,
+  env: Env,
+  user: AuthenticatedUser,
+): Promise<Response> {
   const requestId = crypto.randomUUID();
   try {
     const url = new URL(request.url);
@@ -16,11 +21,11 @@ export async function handleDomainApi(request: Request, env: Env): Promise<Respo
     const catalog = env.WorkspaceCatalog.get(env.WorkspaceCatalog.idFromName("global"));
 
     if (!segments[2]) {
-      if (request.method === "GET") return success(unwrap(await catalog.list()), requestId);
+      if (request.method === "GET") return success(unwrap(await catalog.list(user.id)), requestId);
       if (request.method === "POST") {
         const body = await readJson(request);
         return success(
-          unwrap(await catalog.create((body as Record<string, unknown>).name)),
+          unwrap(await catalog.create(user.id, (body as Record<string, unknown>).name)),
           requestId,
           201,
         );
@@ -33,7 +38,9 @@ export async function handleDomainApi(request: Request, env: Env): Promise<Respo
       if (request.method === "PATCH") {
         const body = await readJson(request);
         return success(
-          unwrap(await catalog.rename(workspaceId, (body as Record<string, unknown>).name)),
+          unwrap(
+            await catalog.rename(user.id, workspaceId, (body as Record<string, unknown>).name),
+          ),
           requestId,
         );
       }
@@ -41,7 +48,7 @@ export async function handleDomainApi(request: Request, env: Env): Promise<Respo
     }
     if (segments[3] !== "domains")
       throw new DomainError("ROUTE_NOT_FOUND", "API route not found.", 404);
-    unwrap(await catalog.ensure(workspaceId));
+    unwrap(await catalog.ensure(user.id, workspaceId));
     const store = env.WorkspaceDomainStore.get(env.WorkspaceDomainStore.idFromName(workspaceId));
     const domainId = segments[4];
     const action = segments[5];

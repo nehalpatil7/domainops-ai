@@ -16,7 +16,7 @@ export class WorkspaceDomainStore extends DurableObject<Env> {
   private readonly repository: DomainRepository;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.repository = new DomainRepository(ctx.storage.sql);
+    this.repository = new DomainRepository(ctx.storage);
   }
 
   listDomains(workspaceId: string): BackendResult<Domain[]> {

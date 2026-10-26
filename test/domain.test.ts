@@ -12,7 +12,10 @@ describe("domain inputs", () => {
     expect(parseRegisterDomainInput({ hostname: "WWW.Cloudflare.COM." })).toEqual({
       hostname: "www.cloudflare.com",
     });
-    expect(() => normalizeHostname("https://cloudflare.com")).toThrow();
+    expect(normalizeHostname("https://www.cloudflare1234.com/")).toBe("www.cloudflare1234.com");
+    expect(() => normalizeHostname("ftp://cloudflare.com")).toThrow();
+    expect(() => normalizeHostname("https://user:secret@cloudflare.com")).toThrow();
+    expect(() => normalizeHostname("https://cloudflare.com:8443")).toThrow();
   });
   it("validates workspace display names", () => {
     expect(validateWorkspaceName("  Platform   team ")).toBe("Platform team");
@@ -45,6 +48,13 @@ describe("diagnostic changes", () => {
   });
   it("does not invent changes for a first observation", () =>
     expect(compareRuns(undefined, run({}))).toEqual([]));
+  it("detects changed DNS values even when the query status is unchanged", () => {
+    const previous = run({ address: "104.16.1.2" });
+    const current = run({ address: "104.16.1.3" });
+    expect(compareRuns(previous, current)).toContainEqual(
+      expect.objectContaining({ area: "dns", message: expect.stringContaining("records changed") }),
+    );
+  });
 });
 
 function run(options: {
@@ -52,6 +62,7 @@ function run(options: {
   dnsStatus?: "success" | "no_records";
   https?: "reachable" | "unreachable";
   tls?: "succeeded" | "failed";
+  address?: string;
 }): LiveDiagnosticRun {
   return {
     id: crypto.randomUUID(),
@@ -70,7 +81,9 @@ function run(options: {
         status: options.dnsStatus ?? "success",
         responseCode: 0,
         responseCodeName: "NOERROR",
-        records: [],
+        records: options.address
+          ? [{ type: "A", name: "www.cloudflare.com", value: options.address, ttl: 300 }]
+          : [],
         error: null,
       },
     ],

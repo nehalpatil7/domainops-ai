@@ -52,7 +52,7 @@ describe("live public diagnostics", () => {
       https: { status: "skipped" },
       tls: { handshake: "not_attempted" },
     });
-    expect(fetcher).toHaveBeenCalledTimes(5);
+    expect(fetcher).toHaveBeenCalledTimes(8);
   });
 
   it("records DNS timeouts as partial evidence and continues safely", async () => {
@@ -73,10 +73,86 @@ describe("live public diagnostics", () => {
     });
     expect(result.https.status).toBe("reachable");
   });
+
+  it("classifies NXDOMAIN explicitly and never attempts HTTPS", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.hostname !== "cloudflare-dns.com") throw new Error("HTTPS must not be called");
+      return Response.json({ Status: 3 });
+    });
+    const result = await runLiveDiagnostics("missing.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "failed",
+      safety: { allowed: false },
+      https: { status: "skipped", classification: "skipped" },
+    });
+    expect(result.dns.every((query) => query.status === "nxdomain")).toBe(true);
+    expect(result.findings).toContain(
+      "The hostname returned NXDOMAIN and does not currently exist in public DNS.",
+    );
+  });
+
+  it("falls back to a bounded GET when a reachable server rejects HEAD", async () => {
+    const methods: string[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input.toString());
+      if (url.hostname === "cloudflare-dns.com")
+        return dnsResponse(url.searchParams.get("type")!, "head.public.net", "104.16.1.2");
+      methods.push(init?.method ?? "GET");
+      return new Response(null, { status: init?.method === "HEAD" ? 405 : 206 });
+    });
+    const result = await runLiveDiagnostics("head.public.net", { fetcher });
+    expect(methods).toEqual(["HEAD", "GET"]);
+    expect(result).toMatchObject({
+      status: "healthy",
+      https: { status: "reachable", method: "GET", statusCode: 206, classification: "success" },
+    });
+  });
+
+  it("blocks HTTPS when public DNS changes between safety snapshots", async () => {
+    let aQueries = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.hostname !== "cloudflare-dns.com") throw new Error("HTTPS must not be called");
+      const type = url.searchParams.get("type")!;
+      if (type === "A") {
+        aQueries++;
+        return dnsAnswer("A", "rebind.public.net", aQueries === 1 ? "104.16.1.2" : "104.16.1.3");
+      }
+      if (type === "AAAA") return Response.json({ Status: 0 });
+      return Response.json({ Status: 0 });
+    });
+    const result = await runLiveDiagnostics("rebind.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "failed",
+      safety: { allowed: false, resolutionStable: false },
+      https: { status: "skipped" },
+    });
+  });
+
+  it("follows a bounded public CNAME chain and records each hop", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.hostname !== "cloudflare-dns.com") return new Response(null, { status: 200 });
+      const name = url.searchParams.get("name")!;
+      const type = url.searchParams.get("type")!;
+      if (name === "alias.public.net" && type === "CNAME")
+        return dnsAnswer("CNAME", name, "edge.public.net.");
+      if (name === "edge.public.net" && type === "A") return dnsAnswer("A", name, "104.16.1.2");
+      return Response.json({ Status: 0 });
+    });
+    const result = await runLiveDiagnostics("alias.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "healthy",
+      cnameChain: [{ from: "alias.public.net", to: "edge.public.net", depth: 1 }],
+      publicAddresses: ["104.16.1.2"],
+      safety: { allowed: true, resolutionStable: true },
+    });
+  });
 });
 
 describe("live diagnostic network safety", () => {
-  it.each(["localhost", "service.internal", "app.local", "demo.example", "https://public.com"])(
+  it.each(["localhost", "service.internal", "app.local", "demo.example", "ftp://public.com"])(
     "rejects unsafe hostname %s",
     (hostname) => expect(() => validateLiveHostname(hostname)).toThrow(),
   );
@@ -111,5 +187,13 @@ function dnsResponse(type: string, hostname: string, address: string): Response 
   return Response.json({
     Status: 0,
     Answer: [{ name: `${hostname}.`, type: typeNumber[type], TTL: 300, data: data[type] }],
+  });
+}
+
+function dnsAnswer(type: string, hostname: string, value: string): Response {
+  const typeNumber: Record<string, number> = { A: 1, AAAA: 28, CNAME: 5, TXT: 16, CAA: 257 };
+  return Response.json({
+    Status: 0,
+    Answer: [{ name: `${hostname}.`, type: typeNumber[type], TTL: 300, data: value }],
   });
 }

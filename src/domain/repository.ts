@@ -15,7 +15,14 @@ type IdempotencyRow = { operation: string; request_json: string; response_json: 
 export type NewDomain = Pick<Domain, "id" | "workspaceId" | "hostname" | "createdAt" | "updatedAt">;
 
 export class DomainRepository {
-  constructor(private readonly sql: SqlStorage) {}
+  private readonly sql: SqlStorage;
+  constructor(private readonly storage: DurableObjectStorage) {
+    this.sql = storage.sql;
+  }
+
+  transaction<T>(action: () => T): T {
+    return this.storage.transactionSync(action);
+  }
 
   ensureSchema(): void {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS workspace_metadata (
@@ -38,7 +45,28 @@ export class DomainRepository {
       workspace_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, operation TEXT NOT NULL,
       request_json TEXT NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL,
       PRIMARY KEY(workspace_id, idempotency_key))`);
-    this.migrateLegacyData();
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS registered_domains_validate_insert
+      BEFORE INSERT ON registered_domains WHEN length(NEW.hostname) < 4 OR length(NEW.hostname) > 253
+      BEGIN SELECT RAISE(ABORT, 'invalid hostname length'); END`);
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS diagnostic_runs_validate_insert
+      BEFORE INSERT ON diagnostic_runs
+      WHEN NEW.status NOT IN ('healthy', 'degraded', 'failed') OR json_valid(NEW.result_json) = 0
+      BEGIN SELECT RAISE(ABORT, 'invalid diagnostic run'); END`);
+    const migrated = this.first<{ name: string }>(
+      "SELECT name FROM schema_migrations WHERE name = ?",
+      "legacy_live_data_v1",
+    );
+    if (!migrated)
+      this.transaction(() => {
+        this.migrateLegacyData();
+        this.sql.exec(
+          "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+          "legacy_live_data_v1",
+          new Date().toISOString(),
+        );
+      });
   }
 
   private migrateLegacyData(): void {
@@ -242,6 +270,21 @@ export class DomainRepository {
       workspaceId,
       key,
       operation,
+    );
+  }
+
+  cleanupIdempotency(workspaceId: string, olderThan: string): void {
+    this.sql.exec(
+      "DELETE FROM idempotency_records_v2 WHERE workspace_id = ? AND created_at < ?",
+      workspaceId,
+      olderThan,
+    );
+    this.sql.exec(
+      `DELETE FROM idempotency_records_v2 WHERE workspace_id = ? AND idempotency_key NOT IN (
+        SELECT idempotency_key FROM idempotency_records_v2 WHERE workspace_id = ?
+        ORDER BY created_at DESC LIMIT 1000)`,
+      workspaceId,
+      workspaceId,
     );
   }
 

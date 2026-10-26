@@ -6,6 +6,7 @@ export interface DomainBackend {
   listDomains(): Promise<Domain[]>;
   getDomain(domainId: string): Promise<Domain>;
   getDiagnosticHistory(domainId: string): Promise<DiagnosticHistoryItem[]>;
+  registerDomain(hostname: string): Promise<Domain>;
   runDiagnostic(domainId: string): Promise<LiveDiagnosticRun | null>;
 }
 type Resolution =
@@ -98,6 +99,25 @@ export function createDomainToolHandlers(backend: DomainBackend) {
           ? buildDiagnosis(current.latestDiagnostic)
           : noObservation(current.hostname);
       }),
+    registerDomain: async ({ domain }: { domain: string }) =>
+      safely("registerDomain", async () => {
+        const resolution = await resolveDomain(domain);
+        if (resolution.result === "found")
+          return {
+            result: "already_registered" as const,
+            source: "live_public" as const,
+            domain: domainSummary(resolution.domain),
+            availableActions: diagnosticAction(resolution.domain.hostname),
+          };
+        if (resolution.result === "ambiguous") return unresolved(resolution);
+        const registered = await backend.registerDomain(domain);
+        return {
+          result: "success" as const,
+          source: "live_public" as const,
+          domain: domainSummary(registered),
+          availableActions: diagnosticAction(registered.hostname),
+        };
+      }),
     runLiveDiagnostic: async ({ domain }: { domain: string }) =>
       safely("runLiveDiagnostic", async () => {
         const resolution = await resolveDomain(domain);
@@ -146,6 +166,12 @@ export function createDomainAssistantTools(backend: DomainBackend) {
         "Diagnose a domain from its latest saved public DNS, HTTPS, and TLS observation.",
       inputSchema: z.object({ domain: z.string().min(1) }),
       execute: handlers.diagnoseDomain,
+    }),
+    registerDomain: tool({
+      description:
+        "Register a public hostname in this workspace. ONLY call when the user explicitly asks to add or register it. Accepts a hostname or HTTP(S) URL.",
+      inputSchema: z.object({ domain: z.string().min(1) }),
+      execute: handlers.registerDomain,
     }),
     runLiveDiagnostic: tool({
       description:
@@ -208,6 +234,7 @@ function buildDiagnosis(run: LiveDiagnosticRun) {
     https: run.https,
     tls: run.tls,
     limitations: run.limitations,
+    availableActions: diagnosticAction(run.hostname),
   };
 }
 
@@ -246,7 +273,17 @@ function noObservation(hostname: string) {
     hostname,
     instruction:
       "Say this domain has not been checked yet. Offer to run a live diagnostic, but do not claim current health.",
+    availableActions: diagnosticAction(hostname),
   };
+}
+function diagnosticAction(hostname: string) {
+  return [
+    {
+      type: "run_diagnostic" as const,
+      label: `Run a fresh check for ${hostname}`,
+      prompt: `Run a live diagnostic check for ${hostname} now.`,
+    },
+  ];
 }
 function unresolved(resolution: Exclude<Resolution, { result: "found" }>) {
   return resolution.result === "ambiguous"
@@ -263,6 +300,15 @@ function unresolved(resolution: Exclude<Resolution, { result: "found" }>) {
         query: resolution.query,
         availableHostnames: resolution.availableHostnames,
         instruction: "Say the domain is not registered in this workspace.",
+        availableActions: resolution.query.includes(".")
+          ? [
+              {
+                type: "register_domain" as const,
+                label: `Register ${resolution.query}`,
+                prompt: `Register the domain ${resolution.query}.`,
+              },
+            ]
+          : [],
       };
 }
 async function safely<T>(operation: string, action: () => Promise<T>) {

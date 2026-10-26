@@ -3,7 +3,13 @@ import { DomainError, toBackendError } from "../domain/errors";
 import type { BackendResult, Workspace } from "../domain/types";
 import { validateWorkspaceId, validateWorkspaceName } from "../domain/validation";
 
-type WorkspaceRow = { id: string; name: string; created_at: string; updated_at: string };
+type WorkspaceRow = {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  owner_id: string | null;
+};
 
 export class WorkspaceCatalog extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -11,18 +17,25 @@ export class WorkspaceCatalog extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS workspaces (
-      id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+      id TEXT PRIMARY KEY, name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80),
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, owner_id TEXT)`);
+    const columns = [...this.sql.exec<{ name: string }>("PRAGMA table_info(workspaces)")];
+    if (!columns.some((column) => column.name === "owner_id"))
+      this.sql.exec("ALTER TABLE workspaces ADD COLUMN owner_id TEXT");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS workspaces_by_owner ON workspaces(owner_id, name)");
   }
-  list(): BackendResult<Workspace[]> {
+
+  list(ownerId: string): BackendResult<Workspace[]> {
     return this.run(() =>
       [
         ...this.sql.exec<WorkspaceRow>(
-          "SELECT * FROM workspaces ORDER BY name COLLATE NOCASE, created_at",
+          "SELECT * FROM workspaces WHERE owner_id = ? ORDER BY name COLLATE NOCASE, created_at",
+          ownerId,
         ),
       ].map(toWorkspace),
     );
   }
-  create(nameValue: unknown): BackendResult<Workspace> {
+  create(ownerId: string, nameValue: unknown): BackendResult<Workspace> {
     return this.run(() => {
       const name = validateWorkspaceName(nameValue);
       const now = new Date().toISOString();
@@ -33,40 +46,76 @@ export class WorkspaceCatalog extends DurableObject<Env> {
         updatedAt: now,
       };
       this.sql.exec(
-        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO workspaces(id, name, created_at, updated_at, owner_id) VALUES (?, ?, ?, ?, ?)",
         workspace.id,
         name,
         now,
         now,
+        ownerId,
       );
       return workspace;
     });
   }
-  ensure(idValue: string, nameValue?: unknown): BackendResult<Workspace> {
+  ensure(ownerId: string, idValue: string, nameValue?: unknown): BackendResult<Workspace> {
     return this.run(() => {
       const id = validateWorkspaceId(idValue);
       const existing = [
         ...this.sql.exec<WorkspaceRow>("SELECT * FROM workspaces WHERE id = ?", id),
       ][0];
-      if (existing) return toWorkspace(existing);
+      if (existing?.owner_id && existing.owner_id !== ownerId)
+        throw new DomainError(
+          "WORKSPACE_FORBIDDEN",
+          "You do not have access to this workspace.",
+          403,
+        );
+      if (existing) {
+        if (!existing.owner_id)
+          this.sql.exec(
+            "UPDATE workspaces SET owner_id = ? WHERE id = ? AND owner_id IS NULL",
+            ownerId,
+            id,
+          );
+        return toWorkspace(existing);
+      }
       const name = nameValue === undefined ? readableName(id) : validateWorkspaceName(nameValue);
       const now = new Date().toISOString();
-      this.sql.exec("INSERT INTO workspaces VALUES (?, ?, ?, ?)", id, name, now, now);
+      this.sql.exec(
+        "INSERT INTO workspaces(id, name, created_at, updated_at, owner_id) VALUES (?, ?, ?, ?, ?)",
+        id,
+        name,
+        now,
+        now,
+        ownerId,
+      );
       return { id, name, createdAt: now, updatedAt: now };
     });
   }
-  rename(idValue: string, nameValue: unknown): BackendResult<Workspace> {
+  authorize(ownerId: string, idValue: string): BackendResult<Workspace> {
+    return this.ensure(ownerId, idValue);
+  }
+  rename(ownerId: string, idValue: string, nameValue: unknown): BackendResult<Workspace> {
     return this.run(() => {
       const id = validateWorkspaceId(idValue);
       const name = validateWorkspaceName(nameValue);
       const now = new Date().toISOString();
       if (
-        this.sql.exec("UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ?", name, now, id)
-          .rowsWritten === 0
+        this.sql.exec(
+          "UPDATE workspaces SET name = ?, updated_at = ? WHERE id = ? AND owner_id = ?",
+          name,
+          now,
+          id,
+          ownerId,
+        ).rowsWritten === 0
       )
         throw new DomainError("WORKSPACE_NOT_FOUND", "Workspace not found.", 404);
       return toWorkspace(
-        [...this.sql.exec<WorkspaceRow>("SELECT * FROM workspaces WHERE id = ?", id)][0]!,
+        [
+          ...this.sql.exec<WorkspaceRow>(
+            "SELECT * FROM workspaces WHERE id = ? AND owner_id = ?",
+            id,
+            ownerId,
+          ),
+        ][0]!,
       );
     });
   }

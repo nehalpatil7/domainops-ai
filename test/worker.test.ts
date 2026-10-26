@@ -24,6 +24,16 @@ describe("Worker entry point", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual([]);
   });
+  it("fails closed on production hosts when Cloudflare Access is not configured", async () => {
+    const response = await worker.fetch(
+      new Request("https://domainops.example/api/workspaces"),
+      env,
+    );
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_NOT_CONFIGURED" },
+    });
+  });
 });
 
 describe("workspace management", () => {
@@ -47,6 +57,26 @@ describe("workspace management", () => {
     const list = ((await (await fetchApi("/api/workspaces")).json()) as Envelope<Workspace[]>).data;
     expect(list).toContainEqual(expect.objectContaining({ id: created.id, name: "Edge platform" }));
   });
+  it("binds an existing workspace to its first authenticated owner", async () => {
+    const catalog = env.WorkspaceCatalog.get(env.WorkspaceCatalog.idFromName("global"));
+    const id = workspaceId("owned");
+    expect(await catalog.ensure("owner-a", id, "Owned workspace")).toMatchObject({ ok: true });
+    expect(await catalog.authorize("owner-b", id)).toMatchObject({
+      ok: false,
+      error: { code: "WORKSPACE_FORBIDDEN", status: 403 },
+    });
+  });
+  it("stores SQL-like workspace names as bound data without changing the schema", async () => {
+    const name = "x'); DROP TABLE workspaces; --";
+    const created = await fetchApi("/api/workspaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    expect(created.status).toBe(201);
+    expect(((await created.json()) as Envelope<Workspace>).data.name).toBe(name);
+    expect((await fetchApi("/api/workspaces")).status).toBe(200);
+  });
 });
 
 describe("live domain registry", () => {
@@ -69,6 +99,18 @@ describe("live domain registry", () => {
       domain: { hostname: "www.cloudflare.com", healthStatus: "unknown", latestDiagnostic: null },
     });
     expect(((await second.json()) as Envelope<{ duplicate: boolean }>).data.duplicate).toBe(true);
+  });
+  it("accepts an HTTPS URL and stores only its normalized hostname", async () => {
+    const workspace = workspaceId("url");
+    const response = await domainRequest(workspace, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:url-input" },
+      body: JSON.stringify({ hostname: "https://www.cloudflare1234.com/" }),
+    });
+    expect(response.status).toBe(201);
+    expect(((await response.json()) as Envelope<{ domain: Domain }>).data.domain.hostname).toBe(
+      "www.cloudflare1234.com",
+    );
   });
   it("keeps domains isolated by workspace", async () => {
     const first = workspaceId("one"),
@@ -122,6 +164,44 @@ describe("live domain registry", () => {
     });
     const history = await store.getDiagnosticHistory(workspace, domain.id);
     expect(history).toMatchObject({ ok: true, value: [{ source: "live_public", changes: [] }] });
+  });
+
+  it("rolls back lock release when diagnostic persistence fails", async () => {
+    const workspace = workspaceId("atomic");
+    const registered = await domainRequest(workspace, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:atomic" },
+      body: JSON.stringify({ hostname: "blog.cloudflare.com" }),
+    });
+    const domain = ((await registered.json()) as Envelope<{ domain: Domain }>).data.domain;
+    const store = env.WorkspaceDomainStore.get(env.WorkspaceDomainStore.idFromName(workspace));
+    const preparation = await store.prepareDiagnostic(workspace, domain.id, "diagnostic:atomic");
+    if (!preparation.ok) throw new Error("Preparation failed");
+    const invalid = {
+      ...diagnosticRun(domain.hostname),
+      status: "invalid",
+    } as unknown as LiveDiagnosticRun;
+    expect(
+      await store.completeDiagnostic(
+        workspace,
+        domain.id,
+        "diagnostic:atomic",
+        preparation.value.requestId,
+        invalid,
+      ),
+    ).toMatchObject({ ok: false, error: { code: "INTERNAL_ERROR" } });
+    expect(await store.prepareDiagnostic(workspace, domain.id, "diagnostic:second")).toMatchObject({
+      ok: false,
+      error: { code: "DIAGNOSTIC_IN_PROGRESS" },
+    });
+    expect(
+      await store.failDiagnostic(
+        workspace,
+        domain.id,
+        "diagnostic:atomic",
+        preparation.value.requestId,
+      ),
+    ).toMatchObject({ ok: true });
   });
 });
 

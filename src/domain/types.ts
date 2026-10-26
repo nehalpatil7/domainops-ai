@@ -20,7 +20,7 @@ export type RegisterDomainResult = { domain: Domain; duplicate: boolean };
 export type LiveDnsRecord = { type: LiveDnsRecordType; name: string; value: string; ttl: number };
 export type LiveDnsQuery = {
   type: LiveDnsRecordType;
-  status: "success" | "no_records" | "error" | "timeout";
+  status: "success" | "no_records" | "nxdomain" | "error" | "timeout";
   responseCode: number | null;
   responseCodeName: string | null;
   records: LiveDnsRecord[];
@@ -28,6 +28,14 @@ export type LiveDnsQuery = {
 };
 export type LiveHttpsObservation = {
   status: "reachable" | "unreachable" | "skipped";
+  method?: "HEAD" | "GET";
+  classification?:
+    | "success"
+    | "redirect"
+    | "client_error"
+    | "server_error"
+    | "network_error"
+    | "skipped";
   url: string;
   statusCode: number | null;
   responseTimeMs: number | null;
@@ -53,7 +61,13 @@ export type LiveDiagnosticRun = {
   dnsProvider: "Cloudflare DNS over HTTPS";
   dns: LiveDnsQuery[];
   publicAddresses: string[];
-  safety: { allowed: boolean; blockedAddresses: string[]; reason: string | null };
+  cnameChain?: Array<{ from: string; to: string; depth: number }>;
+  safety: {
+    allowed: boolean;
+    blockedAddresses: string[];
+    reason: string | null;
+    resolutionStable?: boolean;
+  };
   https: LiveHttpsObservation;
   tls: LiveTlsObservation;
   findings: string[];

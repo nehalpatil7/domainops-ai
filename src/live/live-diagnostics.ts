@@ -13,7 +13,13 @@ type DnsJsonResponse = {
   Status?: number;
   Answer?: Array<{ name?: string; type?: number; TTL?: number; data?: string }>;
 };
+type Resolution = {
+  addresses: string[];
+  chain: Array<{ from: string; to: string; depth: number }>;
+  error: string | null;
+};
 
+const maxCnameDepth = 4;
 const dnsTypeNumbers: Record<LiveDnsRecordType, number> = {
   A: 1,
   AAAA: 28,
@@ -44,33 +50,49 @@ export async function runLiveDiagnostics(
   const dns = await Promise.all(
     liveDnsRecordTypes.map((type) => queryDns(hostname, type, fetcher)),
   );
-  const records = deduplicateRecords(dns.flatMap((query) => query.records));
-  const publicAddresses = records
-    .filter((record) => record.type === "A" || record.type === "AAAA")
-    .map((record) => record.value);
-  const blockedAddresses = publicAddresses.filter((address) => !isPublicIpAddress(address));
-  const safetyAllowed = publicAddresses.length > 0 && blockedAddresses.length === 0;
-  const safetyReason =
-    blockedAddresses.length > 0
-      ? "HTTPS probe blocked because DNS returned a non-public address."
-      : publicAddresses.length === 0
-        ? "HTTPS probe skipped because no public A or AAAA address was observed."
-        : null;
+  const firstResolution = await resolveCnameChain(hostname, fetcher, dns);
+  const secondResolution = await resolveCnameChain(hostname, fetcher);
+  const publicAddresses = unique(firstResolution.addresses);
+  const allObservedAddresses = unique([
+    ...firstResolution.addresses,
+    ...secondResolution.addresses,
+  ]);
+  const blockedAddresses = allObservedAddresses.filter((address) => !isPublicIpAddress(address));
+  const resolutionStable =
+    sameStrings(firstResolution.addresses, secondResolution.addresses) &&
+    sameChain(firstResolution.chain, secondResolution.chain);
+  const resolutionError = firstResolution.error ?? secondResolution.error;
+  const safetyAllowed =
+    publicAddresses.length > 0 &&
+    blockedAddresses.length === 0 &&
+    resolutionStable &&
+    !resolutionError;
+  const safetyReason = blockedAddresses.length
+    ? "HTTPS probe blocked because DNS returned a non-public address."
+    : resolutionError
+      ? `HTTPS probe skipped: ${resolutionError}`
+      : !resolutionStable
+        ? "HTTPS probe skipped because DNS changed during the safety preflight."
+        : publicAddresses.length === 0
+          ? "HTTPS probe skipped because no public address was observed through the bounded CNAME chain."
+          : null;
   const https = safetyAllowed
     ? await probeHttps(hostname, fetcher)
     : skippedHttps(hostname, safetyReason!);
   const completed = now();
-  const failedQueries = dns.filter(
-    (query) => query.status === "error" || query.status === "timeout",
-  );
-  const hasDnsEvidence = dns.some((query) => query.status === "success");
+  const partialDns = dns.some((query) => query.status === "error" || query.status === "timeout");
+  const nxdomain = dns.some((query) => query.status === "nxdomain");
+  const httpHealthy = https.classification === "success";
   const status =
-    blockedAddresses.length > 0 || (!hasDnsEvidence && https.status !== "reachable")
+    nxdomain ||
+    blockedAddresses.length ||
+    resolutionError ||
+    !resolutionStable ||
+    https.status === "unreachable"
       ? "failed"
-      : failedQueries.length > 0 || https.status !== "reachable"
+      : partialDns || !httpHealthy
         ? "degraded"
         : "healthy";
-  const findings = buildFindings(dns, https, blockedAddresses);
 
   return {
     id: options.requestId ?? crypto.randomUUID(),
@@ -85,7 +107,8 @@ export async function runLiveDiagnostics(
     dnsProvider: "Cloudflare DNS over HTTPS",
     dns,
     publicAddresses,
-    safety: { allowed: safetyAllowed, blockedAddresses, reason: safetyReason },
+    cnameChain: firstResolution.chain,
+    safety: { allowed: safetyAllowed, blockedAddresses, reason: safetyReason, resolutionStable },
     https,
     tls: {
       handshake:
@@ -96,15 +119,72 @@ export async function runLiveDiagnostics(
             : "not_attempted",
       certificateMetadataAvailable: false,
       limitation:
-        "Cloudflare Workers fetch confirms whether the HTTPS/TLS request succeeded but does not expose the peer certificate chain, issuer, serial number, or expiry.",
+        "Cloudflare Workers fetch confirms whether the HTTPS/TLS request succeeded but does not expose the peer certificate chain, issuer, SANs, serial number, or expiry.",
     },
-    findings,
+    findings: buildFindings(dns, https, blockedAddresses, resolutionStable, firstResolution.chain),
     limitations: [
       "This is a point-in-time public observation and may vary during DNS propagation.",
       "Public diagnostics cannot reveal internal Cloudflare for SaaS hostname or certificate provisioning status.",
       "Redirects are reported but not followed for SSRF safety.",
+      "Two DNS snapshots reduce rebinding risk, but Workers fetch cannot pin the HTTPS request to the preflight IP; Cloudflare outbound-network controls remain an additional boundary.",
     ],
   };
+}
+
+async function resolveCnameChain(
+  hostname: string,
+  fetcher: Fetcher,
+  initial?: LiveDnsQuery[],
+): Promise<Resolution> {
+  const seen = new Set<string>();
+  const chain: Resolution["chain"] = [];
+  let current = hostname;
+  for (let depth = 0; depth <= maxCnameDepth; depth++) {
+    if (seen.has(current)) return { addresses: [], chain, error: "CNAME loop detected." };
+    seen.add(current);
+    const queries =
+      depth === 0 && initial
+        ? initial.filter(
+            (query) => query.type === "A" || query.type === "AAAA" || query.type === "CNAME",
+          )
+        : await Promise.all(
+            (["A", "AAAA", "CNAME"] as const).map((type) => queryDns(current, type, fetcher)),
+          );
+    if (queries.some((query) => query.status === "nxdomain"))
+      return { addresses: [], chain, error: `${current} does not exist (NXDOMAIN).` };
+    if (queries.some((query) => query.status === "error" || query.status === "timeout"))
+      return { addresses: [], chain, error: `DNS resolution for ${current} was incomplete.` };
+    const addresses = unique(
+      queries
+        .flatMap((query) => query.records)
+        .filter((record) => record.type === "A" || record.type === "AAAA")
+        .map((record) => record.value),
+    );
+    if (addresses.length) return { addresses, chain, error: null };
+    const targets = unique(
+      queries
+        .flatMap((query) => query.records)
+        .filter((record) => record.type === "CNAME")
+        .map((record) => record.value),
+    );
+    if (!targets.length) return { addresses: [], chain, error: null };
+    if (targets.length !== 1)
+      return {
+        addresses: [],
+        chain,
+        error: `Multiple CNAME targets were observed for ${current}.`,
+      };
+    if (depth === maxCnameDepth)
+      return {
+        addresses: [],
+        chain,
+        error: `CNAME chain exceeds the ${maxCnameDepth}-hop safety limit.`,
+      };
+    const target = validateLiveHostname(targets[0]);
+    chain.push({ from: current, to: target, depth: depth + 1 });
+    current = target;
+  }
+  return { addresses: [], chain, error: "CNAME resolution stopped unexpectedly." };
 }
 
 async function queryDns(
@@ -120,16 +200,25 @@ async function queryDns(
       headers: { Accept: "application/dns-json" },
       signal: AbortSignal.timeout(3_000),
     });
-    if (!response.ok) {
+    if (!response.ok)
       return dnsFailure(type, "error", `DNS over HTTPS returned HTTP ${response.status}.`);
-    }
     const payload = (await response.json()) as DnsJsonResponse;
     const responseCode = typeof payload.Status === "number" ? payload.Status : null;
-    const answers = (payload.Answer ?? [])
-      .map(toDnsRecord)
-      .filter((record): record is LiveDnsRecord => record !== null);
-    const records = deduplicateRecords(answers);
-    if (responseCode !== 0) {
+    const records = deduplicateRecords(
+      (payload.Answer ?? [])
+        .map(toDnsRecord)
+        .filter((record): record is LiveDnsRecord => record !== null),
+    );
+    if (responseCode === 3)
+      return {
+        type,
+        status: "nxdomain",
+        responseCode,
+        responseCodeName: "NXDOMAIN",
+        records: [],
+        error: "Hostname does not exist (NXDOMAIN).",
+      };
+    if (responseCode !== 0)
       return {
         type,
         status: "error",
@@ -138,7 +227,6 @@ async function queryDns(
         records,
         error: `DNS resolver returned ${responseCodeNames[responseCode ?? -1] ?? `rcode ${responseCode}`}.`,
       };
-    }
     return {
       type,
       status: records.some((record) => record.type === type) ? "success" : "no_records",
@@ -159,17 +247,29 @@ async function queryDns(
 }
 
 async function probeHttps(hostname: string, fetcher: Fetcher): Promise<LiveHttpsObservation> {
+  const head = await requestHttps(hostname, "HEAD", fetcher);
+  if (head.statusCode !== 405 && head.statusCode !== 501) return head;
+  return requestHttps(hostname, "GET", fetcher);
+}
+async function requestHttps(
+  hostname: string,
+  method: "HEAD" | "GET",
+  fetcher: Fetcher,
+): Promise<LiveHttpsObservation> {
   const url = `https://${hostname}/`;
   const started = Date.now();
   try {
     const response = await fetcher(url, {
-      method: "HEAD",
+      method,
       redirect: "manual",
       signal: AbortSignal.timeout(5_000),
-      headers: { Accept: "*/*" },
+      headers: method === "GET" ? { Accept: "*/*", Range: "bytes=0-0" } : { Accept: "*/*" },
     });
+    if (method === "GET") void response.body?.cancel();
     return {
       status: "reachable",
+      method,
+      classification: classifyHttpStatus(response.status),
       url,
       statusCode: response.status,
       responseTimeMs: Math.max(0, Date.now() - started),
@@ -182,6 +282,8 @@ async function probeHttps(hostname: string, fetcher: Fetcher): Promise<LiveHttps
       cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError");
     return {
       status: "unreachable",
+      method,
+      classification: "network_error",
       url,
       statusCode: null,
       responseTimeMs: Math.max(0, Date.now() - started),
@@ -191,10 +293,17 @@ async function probeHttps(hostname: string, fetcher: Fetcher): Promise<LiveHttps
     };
   }
 }
-
+function classifyHttpStatus(status: number): NonNullable<LiveHttpsObservation["classification"]> {
+  if (status >= 200 && status < 300) return "success";
+  if (status >= 300 && status < 400) return "redirect";
+  if (status >= 400 && status < 500) return "client_error";
+  return "server_error";
+}
 function skippedHttps(hostname: string, reason: string): LiveHttpsObservation {
   return {
     status: "skipped",
+    method: "HEAD",
+    classification: "skipped",
     url: `https://${hostname}/`,
     statusCode: null,
     responseTimeMs: null,
@@ -214,13 +323,11 @@ function toDnsRecord(answer: NonNullable<DnsJsonResponse["Answer"]>[number]): Li
     ttl: typeof answer.TTL === "number" ? answer.TTL : 0,
   };
 }
-
 function normalizeDnsValue(type: LiveDnsRecordType, value: string): string {
   if (type === "CNAME") return value.toLowerCase().replace(/\.$/, "");
   if (type === "TXT") return value.replace(/^"|"$/g, "");
   return value;
 }
-
 function deduplicateRecords(records: LiveDnsRecord[]): LiveDnsRecord[] {
   return [
     ...new Map(
@@ -228,7 +335,6 @@ function deduplicateRecords(records: LiveDnsRecord[]): LiveDnsRecord[] {
     ).values(),
   ];
 }
-
 function dnsFailure(
   type: LiveDnsRecordType,
   status: "error" | "timeout",
@@ -236,17 +342,16 @@ function dnsFailure(
 ): LiveDnsQuery {
   return { type, status, responseCode: null, responseCodeName: null, records: [], error };
 }
-
 function sanitizeRedirect(value: string | null): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
     return `${url.protocol}//${url.host}${url.pathname}`;
   } catch {
     return null;
   }
 }
-
 function selectedHeaders(headers: Headers): Record<string, string> {
   const selected: Record<string, string> = {};
   for (const name of ["content-type", "server", "strict-transport-security"]) {
@@ -255,27 +360,46 @@ function selectedHeaders(headers: Headers): Record<string, string> {
   }
   return selected;
 }
-
+function unique(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+function sameStrings(a: string[], b: string[]): boolean {
+  return JSON.stringify(unique(a)) === JSON.stringify(unique(b));
+}
+function sameChain(a: Resolution["chain"], b: Resolution["chain"]): boolean {
+  return (
+    JSON.stringify(a.map(({ from, to }) => ({ from, to }))) ===
+    JSON.stringify(b.map(({ from, to }) => ({ from, to })))
+  );
+}
 function buildFindings(
   dns: LiveDnsQuery[],
   https: LiveHttpsObservation,
-  blockedAddresses: string[],
+  blocked: string[],
+  stable: boolean,
+  chain: Resolution["chain"],
 ): string[] {
   const findings: string[] = [];
+  if (dns.some((query) => query.status === "nxdomain"))
+    findings.push("The hostname returned NXDOMAIN and does not currently exist in public DNS.");
   for (const query of dns) {
-    if (query.status === "success") {
-      const count = query.records.filter((record) => record.type === query.type).length;
-      findings.push(`Observed ${count} public ${query.type} record(s).`);
-    } else if (query.status === "error" || query.status === "timeout") {
+    if (query.status === "success")
+      findings.push(
+        `Observed ${query.records.filter((record) => record.type === query.type).length} public ${query.type} record(s).`,
+      );
+    else if (query.status === "error" || query.status === "timeout")
       findings.push(`${query.type} lookup unavailable: ${query.error}`);
-    }
   }
-  if (blockedAddresses.length) {
+  if (chain.length)
+    findings.push(`Resolved a ${chain.length}-hop CNAME chain to ${chain.at(-1)!.to}.`);
+  if (!stable)
+    findings.push("DNS answers changed between safety snapshots; HTTPS was not requested.");
+  if (blocked.length)
     findings.push("HTTPS probe was blocked because DNS returned a non-public address.");
-  } else if (https.status === "reachable") {
-    findings.push(`HTTPS responded with status ${https.statusCode}; TLS handshake succeeded.`);
-  } else {
-    findings.push(https.error ?? "HTTPS observation was unavailable.");
-  }
-  return findings;
+  else if (https.status === "reachable")
+    findings.push(
+      `HTTPS ${https.method} responded with status ${https.statusCode} (${https.classification}); TLS handshake succeeded.`,
+    );
+  else if (https.error) findings.push(https.error);
+  return unique(findings);
 }

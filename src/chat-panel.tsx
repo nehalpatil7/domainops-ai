@@ -54,7 +54,14 @@ export function ChatPanel({ workspaceId, onClose }: { workspaceId: string; onClo
             <button onClick={() => setInput("Run a live check for ")}>Run a live check</button>
           </div>
         ) : (
-          messages.map((message) => <ChatMessage key={message.id} message={message} />)
+          messages.map((message) => (
+            <ChatMessage
+              key={message.id}
+              message={message}
+              busy={busy}
+              onAction={(prompt) => sendMessage({ text: prompt })}
+            />
+          ))
         )}
         {status === "submitted" ? (
           <div className="chat-status">
@@ -98,7 +105,15 @@ export function ChatPanel({ workspaceId, onClose }: { workspaceId: string; onClo
   );
 }
 
-function ChatMessage({ message }: { message: UIMessage }) {
+function ChatMessage({
+  message,
+  busy,
+  onAction,
+}: {
+  message: UIMessage;
+  busy: boolean;
+  onAction(prompt: string): void;
+}) {
   return (
     <article className={`message ${message.role}`}>
       <div className="message-role">{message.role === "user" ? "You" : "DomainOps AI"}</div>
@@ -108,6 +123,8 @@ function ChatMessage({ message }: { message: UIMessage }) {
           if (isToolUIPart(part)) {
             const name = getToolName(part);
             const output = "output" in part ? part.output : undefined;
+            const input = "input" in part ? part.input : undefined;
+            const errorText = "errorText" in part ? part.errorText : undefined;
             const failed =
               part.state === "output-error" ||
               Boolean(
@@ -117,23 +134,20 @@ function ChatMessage({ message }: { message: UIMessage }) {
                 output.result === "error",
               );
             return (
-              <details
-                className={`tool-call ${failed ? "failed" : ""}`}
-                key={part.toolCallId}
-                open={failed}
-              >
-                <summary>
+              <div className={`tool-call ${failed ? "failed" : ""}`} key={part.toolCallId}>
+                <div className="tool-call-heading">
                   <i />
                   {toolLabel(name, part.state)}
-                </summary>
+                  {toolSubject(input) ? <b>{toolSubject(input)}</b> : null}
+                </div>
                 {failed ? (
-                  <p>{toolError(output)}</p>
+                  <p>{toolError(errorText ?? output)}</p>
                 ) : output === undefined ? (
-                  <small>Please wait while the public observation is retrieved.</small>
+                  <small>{toolProgress(name)}</small>
                 ) : (
-                  <small>Diagnostic evidence received.</small>
+                  <ToolResult output={output} busy={busy} onAction={onAction} />
                 )}
-              </details>
+              </div>
             );
           }
           return null;
@@ -150,13 +164,163 @@ function toolLabel(name: string, state: string) {
     getDnsConfiguration: "Inspecting public DNS",
     getDiagnosticHistory: "Reviewing diagnostic history",
     diagnoseDomain: "Analyzing observed issues",
+    registerDomain: "Registering domain",
     runLiveDiagnostic: "Running public DNS and HTTPS checks",
   };
   const verb =
     state === "output-available" ? "Complete" : state === "output-error" ? "Failed" : "In progress";
   return `${labels[name] ?? "Using diagnostic tool"} · ${verb}`;
 }
+
+function ToolResult({
+  output,
+  busy,
+  onAction,
+}: {
+  output: unknown;
+  busy: boolean;
+  onAction(prompt: string): void;
+}) {
+  const result = asRecord(output);
+  if (!result) return <small>Tool completed without a displayable result.</small>;
+  if (result.result === "error")
+    return <p>{stringValue(result.message, "Tool request failed.")}</p>;
+  if (result.result === "ambiguous")
+    return <p>More than one domain matched. Choose an exact hostname.</p>;
+  if (result.result === "not_found") return <p>No registered domain matched this request.</p>;
+  const domain = asRecord(result.domain);
+  const dns = Array.isArray(result.dns) ? result.dns.map(asRecord).filter(Boolean) : [];
+  const domains = Array.isArray(result.domains) ? result.domains.map(asRecord).filter(Boolean) : [];
+  const runs = Array.isArray(result.runs) ? result.runs.map(asRecord).filter(Boolean) : [];
+  const facts = Array.isArray(result.observedFacts)
+    ? result.observedFacts.filter((item): item is string => typeof item === "string")
+    : [];
+  return (
+    <div className="tool-result">
+      {domain ? (
+        <div className="tool-result-line">
+          <strong>{stringValue(domain.hostname, "Domain")}</strong>
+          <span>
+            {label(stringValue(domain.healthStatus, stringValue(result.result, "complete")))}
+          </span>
+        </div>
+      ) : null}
+      {typeof result.hostname === "string" ? (
+        <div className="tool-result-line">
+          <strong>{result.hostname}</strong>
+          <span>{label(stringValue(result.status, stringValue(result.result, "complete")))}</span>
+        </div>
+      ) : null}
+      {typeof result.count === "number" ? (
+        <p>
+          {result.count} domain{result.count === 1 ? "" : "s"} returned.
+        </p>
+      ) : null}
+      {domains.length ? (
+        <div className="tool-domain-results">
+          {domains.slice(0, 8).map((item, index) => (
+            <span key={`${stringValue(item?.hostname, "domain")}:${index}`}>
+              <b>{stringValue(item?.hostname, "Domain")}</b>
+              {label(stringValue(item?.healthStatus, "unknown"))}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {dns.length ? (
+        <div className="tool-dns-results">
+          {dns.map((query, index) => (
+            <span key={`${stringValue(query?.type, "DNS")}:${index}`}>
+              <b>{stringValue(query?.type, "DNS")}</b>{" "}
+              {label(stringValue(query?.status, "unknown"))}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {facts.length ? (
+        <ul>
+          {facts.slice(0, 4).map((fact) => (
+            <li key={fact}>{fact}</li>
+          ))}
+        </ul>
+      ) : null}
+      {runs.length ? (
+        <p>
+          {runs.length} saved check{runs.length === 1 ? "" : "s"}; latest{" "}
+          {formatToolTime(runs[0]?.observedAt)}.
+        </p>
+      ) : null}
+      {typeof result.observedAt === "string" ? (
+        <small>
+          Observed {formatToolTime(result.observedAt)} ·{" "}
+          {stringValue(result.freshness, "timestamped result")}
+        </small>
+      ) : null}
+      <ToolActions value={result.availableActions} busy={busy} onAction={onAction} />
+    </div>
+  );
+}
+
+function ToolActions({
+  value,
+  busy,
+  onAction,
+}: {
+  value: unknown;
+  busy: boolean;
+  onAction(prompt: string): void;
+}) {
+  if (!Array.isArray(value)) return null;
+  const actions = value
+    .map(asRecord)
+    .filter((item): item is Record<string, unknown> =>
+      Boolean(item && typeof item.prompt === "string" && typeof item.label === "string"),
+    );
+  return (
+    <div className="tool-actions">
+      {actions.map((action) => (
+        <button
+          key={action.prompt as string}
+          disabled={busy}
+          onClick={() => onAction(action.prompt as string)}
+        >
+          {action.label as string}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function toolSubject(input: unknown): string | null {
+  const value = asRecord(input);
+  return value && typeof value.domain === "string" ? value.domain : null;
+}
+function toolProgress(name: string): string {
+  return name === "runLiveDiagnostic"
+    ? "Resolving DNS twice, validating the target, then checking HTTPS…"
+    : name === "registerDomain"
+      ? "Validating and saving the hostname…"
+      : "Waiting for the workspace backend…";
+}
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+function label(value: string): string {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+function formatToolTime(value: unknown): string {
+  return typeof value === "string"
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
+        new Date(value),
+      )
+    : "unknown time";
+}
 function toolError(output: unknown) {
+  if (typeof output === "string") return output;
   if (
     output &&
     typeof output === "object" &&

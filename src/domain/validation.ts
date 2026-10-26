@@ -9,7 +9,27 @@ const idempotencyPattern = /^[A-Za-z0-9._:-]{8,128}$/;
 
 export function normalizeHostname(value: unknown, field = "hostname"): string {
   if (typeof value !== "string") throw DomainError.invalid(`${field} must be a string.`);
-  const hostname = value.trim().toLowerCase().replace(/\.$/, "");
+  const input = value.trim();
+  let candidate = input;
+  if (input.includes("://")) {
+    try {
+      const url = new URL(input);
+      if (
+        (url.protocol !== "https:" && url.protocol !== "http:") ||
+        url.username ||
+        url.password ||
+        url.port
+      )
+        throw new Error("Unsafe URL components.");
+      candidate = url.hostname;
+    } catch {
+      throw DomainError.invalid(
+        `${field} must be a hostname or an HTTP(S) URL without credentials or a custom port.`,
+        { field },
+      );
+    }
+  }
+  const hostname = candidate.toLowerCase().replace(/\.$/, "");
   if (!hostnamePattern.test(hostname)) {
     throw DomainError.invalid(`${field} must be a valid ASCII fully-qualified hostname.`, {
       field,
