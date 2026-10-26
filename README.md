@@ -6,6 +6,8 @@
 
 [![Live Demo](https://img.shields.io/badge/🚀_Launch_Live_Demo-Visit_App-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://domainops-ai.nehal-d-patil7.workers.dev)
 
+**[Use this link if the button above does not work!](https://domainops-ai.nehal-d-patil7.workers.dev)**
+
 ![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)
 ![Workers AI](https://img.shields.io/badge/Workers-AI-blue)
 ![Durable Objects](https://img.shields.io/badge/Durable_Objects-SQLite-green)
