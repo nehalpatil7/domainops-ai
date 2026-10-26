@@ -199,6 +199,17 @@ export default function App() {
           <button className="secondary compact" onClick={() => openWorkspaceDialog("create")}>
             + Workspace
           </button>
+          <button
+            type="button"
+            className="secondary compact"
+            onClick={() => {
+              localStorage.removeItem(workspaceStorageKey);
+              window.location.assign("/cdn-cgi/access/logout");
+            }}
+            title="Sign out of Cloudflare Access"
+          >
+            Log out
+          </button>
           <button className="copilot-button" onClick={() => setDrawerOpen(true)}>
             <span>✦</span> Ask Copilot
           </button>
