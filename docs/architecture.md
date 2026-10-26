@@ -62,7 +62,7 @@ History compares each result with its immediate predecessor. Changes cover overa
 
 A check accepts either a normalized ASCII FQDN or an HTTP(S) URL reduced to its hostname. It queries only five displayed record types and resolves at most four CNAME hops. Two independently fetched, bounded resolution snapshots must have identical chains and address sets, and every address/target must be public. This reduces DNS-rebinding exposure before the Workers runtime performs its own resolution.
 
-The HTTPS probe is fixed to port 443, does not follow redirects, stores only selected headers, and has a bounded timeout. It uses `HEAD`, with one range-limited `GET` fallback only for `405`/`501`. `NXDOMAIN`, no records, resolver failures, timeouts, HTTP response classes, and network/TLS failures stay distinct.
+The HTTPS probe is fixed to port 443, stores only selected headers, and has a bounded timeout. It uses `HEAD`, with one range-limited `GET` fallback only for `405`/`501`. It manually follows up to three `301`/`302`/`307`/`308` hops, requiring HTTPS plus two stable public address snapshots at every destination and rejecting loops. Verified healthy destinations are healthy redirects; destinations that cannot be verified are neutral/unverified rather than confirmed failures. Original URL, final URL, and hop evidence are persisted. `NXDOMAIN`, no records, resolver failures, timeouts, HTTP response classes, and network/TLS failures stay distinct.
 
 The Durable Object supplies idempotency, a 60-second stale-lock boundary, 30-second completed-result reuse, and a 50-result retention cap. Agent-triggered checks call this exact same pipeline, so they cannot bypass its hostname, SSRF, timeout, concurrency, or request-replay controls.
 

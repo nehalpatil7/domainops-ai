@@ -65,7 +65,7 @@ export function LiveDiagnosticsPanel({ workspaceId, domain, checking, onRun, onU
       ) : latest ? (
         <div className="diagnostic-content">
           <div className="summary-strip">
-            <Status status={latest.status} />
+            <Status status={latest.status} classification={latest.https.classification} />
             <div>
               <span>Last checked</span>
               <strong>{formatTime(latest.observedAt)}</strong>
@@ -136,9 +136,14 @@ export function LiveDiagnosticsPanel({ workspaceId, domain, checking, onRun, onU
               />
               <Fact label="TLS handshake" value={latest.tls.handshake} />
             </div>
-            {latest.https.redirectLocation ? (
+            {latest.https.redirects?.length ? (
               <p className="callout">
-                Redirect observed (not followed): <code>{latest.https.redirectLocation}</code>
+                Original: <code>{latest.https.originalUrl ?? latest.https.url}</code>
+                <br />
+                Final destination: <code>{latest.https.finalUrl ?? "Unverified"}</code>
+                <br />
+                Redirect result:{" "}
+                <strong>{label(latest.https.classification ?? "redirect_unverified")}</strong>
               </p>
             ) : null}
             <p className="limitation">{latest.tls.limitation}</p>
@@ -212,11 +217,27 @@ function Fact({ label: name, value }: { label: string; value: string }) {
     </div>
   );
 }
-function Status({ status }: { status: "healthy" | "degraded" | "failed" }) {
+function Status({
+  status,
+  classification,
+}: {
+  status: "healthy" | "degraded" | "failed";
+  classification?: string;
+}) {
+  const text =
+    classification === "redirected"
+      ? "Healthy (Redirected)"
+      : classification === "redirect_unverified"
+        ? "Redirect Detected (Unverified)"
+        : classification === "redirect_loop"
+          ? "Redirect Loop"
+          : status === "healthy"
+            ? "Healthy"
+            : "Needs attention";
   return (
     <div className={`result-status live-${status}`}>
       <span>Result</span>
-      <strong>{status === "healthy" ? "Healthy" : "Needs attention"}</strong>
+      <strong>{text}</strong>
     </div>
   );
 }

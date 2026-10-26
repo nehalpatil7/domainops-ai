@@ -82,13 +82,14 @@ export async function runLiveDiagnostics(
   const completed = now();
   const partialDns = dns.some((query) => query.status === "error" || query.status === "timeout");
   const nxdomain = dns.some((query) => query.status === "nxdomain");
-  const httpHealthy = https.classification === "success";
+  const httpHealthy = https.classification === "success" || https.classification === "redirected";
   const status =
     nxdomain ||
     blockedAddresses.length ||
     resolutionError ||
     !resolutionStable ||
-    https.status === "unreachable"
+    https.status === "unreachable" ||
+    https.classification === "redirect_loop"
       ? "failed"
       : partialDns || !httpHealthy
         ? "degraded"
@@ -256,16 +257,90 @@ async function queryDns(
 }
 
 async function probeHttps(hostname: string, fetcher: Fetcher): Promise<LiveHttpsObservation> {
-  const head = await requestHttps(hostname, "HEAD", fetcher);
-  if (head.statusCode !== 405 && head.statusCode !== 501) return head;
-  return requestHttps(hostname, "GET", fetcher);
+  const originalUrl = `https://${hostname}/`;
+  let currentUrl = originalUrl;
+  const visited = new Set([currentUrl]);
+  const redirects: NonNullable<LiveHttpsObservation["redirects"]> = [];
+  for (let hop = 0; hop <= 3; hop++) {
+    let observation = await requestHttps(currentUrl, "HEAD", fetcher);
+    if (observation.statusCode === 405 || observation.statusCode === 501)
+      observation = await requestHttps(currentUrl, "GET", fetcher);
+    const redirectStatus = observation.statusCode;
+    if (!redirectStatus || ![301, 302, 307, 308].includes(redirectStatus)) {
+      return {
+        ...observation,
+        classification:
+          redirects.length && observation.classification === "success"
+            ? "redirected"
+            : observation.classification,
+        originalUrl,
+        finalUrl: currentUrl,
+        redirects,
+      };
+    }
+    const destination = redirectDestination(observation.redirectLocation, currentUrl);
+    if (!destination || hop === 3) {
+      redirects.push({
+        from: currentUrl,
+        to: destination ?? observation.redirectLocation ?? "unavailable",
+        statusCode: redirectStatus,
+        verified: false,
+        reason: destination
+          ? "Redirect hop limit reached."
+          : "Redirect destination is invalid or unsafe.",
+      });
+      return {
+        ...observation,
+        classification: "redirect_unverified",
+        originalUrl,
+        finalUrl: destination ?? currentUrl,
+        redirects,
+      };
+    }
+    if (visited.has(destination)) {
+      redirects.push({
+        from: currentUrl,
+        to: destination,
+        statusCode: redirectStatus,
+        verified: false,
+        reason: "Redirect loop detected.",
+      });
+      return {
+        ...observation,
+        classification: "redirect_loop",
+        originalUrl,
+        finalUrl: destination,
+        redirects,
+        error: "Redirect loop detected.",
+      };
+    }
+    const safety = await verifyRedirectTarget(new URL(destination).hostname, fetcher);
+    redirects.push({
+      from: currentUrl,
+      to: destination,
+      statusCode: redirectStatus,
+      verified: safety.safe,
+      reason: safety.reason,
+    });
+    if (!safety.safe)
+      return {
+        ...observation,
+        classification: "redirect_unverified",
+        originalUrl,
+        finalUrl: destination,
+        redirects,
+        error: safety.reason,
+      };
+    visited.add(destination);
+    currentUrl = destination;
+  }
+  throw new Error("Unreachable redirect state.");
 }
 async function requestHttps(
-  hostname: string,
+  url: string,
   method: "HEAD" | "GET",
   fetcher: Fetcher,
 ): Promise<LiveHttpsObservation> {
-  const url = `https://${hostname}/`;
   const started = Date.now();
   try {
     const response = await fetcher(url, {
@@ -282,7 +357,7 @@ async function requestHttps(
       url,
       statusCode: response.status,
       responseTimeMs: Math.max(0, Date.now() - started),
-      redirectLocation: sanitizeRedirect(response.headers.get("location")),
+      redirectLocation: sanitizeRedirect(response.headers.get("location"), url),
       headers: selectedHeaders(response.headers),
       error: null,
     };
@@ -304,9 +379,54 @@ async function requestHttps(
 }
 function classifyHttpStatus(status: number): NonNullable<LiveHttpsObservation["classification"]> {
   if (status >= 200 && status < 300) return "success";
-  if (status >= 300 && status < 400) return "redirect";
+  if (status >= 300 && status < 400) return "redirect_unverified";
   if (status >= 400 && status < 500) return "client_error";
   return "server_error";
+}
+
+async function verifyRedirectTarget(
+  hostname: string,
+  fetcher: Fetcher,
+): Promise<{ safe: boolean; reason: string | null }> {
+  try {
+    validateLiveHostname(hostname);
+  } catch {
+    return { safe: false, reason: "Redirect target is not a permitted public hostname." };
+  }
+  const snapshots = await Promise.all(
+    [0, 1].map(async () =>
+      unique(
+        (
+          await Promise.all(
+            (["A", "AAAA"] as const).map((type) => queryDns(hostname, type, fetcher)),
+          )
+        )
+          .flatMap((query) => query.records)
+          .filter((record) => record.type === "A" || record.type === "AAAA")
+          .map((record) => record.value),
+      ),
+    ),
+  );
+  if (!snapshots[0].length)
+    return { safe: false, reason: "Redirect target has no directly observed public address." };
+  if (!sameStrings(snapshots[0], snapshots[1]))
+    return { safe: false, reason: "Redirect target DNS changed during safety validation." };
+  if (snapshots[0].some((address) => !isPublicIpAddress(address)))
+    return { safe: false, reason: "Redirect target resolves to a non-public address." };
+  return { safe: true, reason: null };
+}
+
+function redirectDestination(location: string | null, currentUrl: string): string | null {
+  if (!location) return null;
+  try {
+    const target = new URL(location, currentUrl);
+    if (target.protocol !== "https:" || target.username || target.password || target.port)
+      return null;
+    target.hash = "";
+    return target.toString();
+  } catch {
+    return null;
+  }
 }
 function skippedHttps(hostname: string, reason: string): LiveHttpsObservation {
   return {
@@ -351,10 +471,10 @@ function dnsFailure(
 ): LiveDnsQuery {
   return { type, status, responseCode: null, responseCodeName: null, records: [], error };
 }
-function sanitizeRedirect(value: string | null): string | null {
+function sanitizeRedirect(value: string | null, baseUrl: string): string | null {
   if (!value) return null;
   try {
-    const url = new URL(value);
+    const url = new URL(value, baseUrl);
     if (url.protocol !== "https:" && url.protocol !== "http:") return null;
     return `${url.protocol}//${url.host}${url.pathname}`;
   } catch {

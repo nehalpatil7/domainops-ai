@@ -168,6 +168,84 @@ describe("live public diagnostics", () => {
       https: { status: "skipped" },
     });
   });
+
+  it("classifies a healthy apex-to-www redirect as Healthy (Redirected)", async () => {
+    const fetcher = redirectFetcher((url) =>
+      url.hostname === "hubspot.com"
+        ? new Response(null, { status: 301, headers: { location: "https://www.hubspot.com/" } })
+        : new Response(null, { status: 200 }),
+    );
+    const result = await runLiveDiagnostics("hubspot.com", { fetcher });
+    expect(result).toMatchObject({
+      status: "healthy",
+      https: {
+        classification: "redirected",
+        originalUrl: "https://hubspot.com/",
+        finalUrl: "https://www.hubspot.com/",
+        redirects: [{ statusCode: 301, verified: true }],
+      },
+    });
+  });
+
+  it("detects redirect loops", async () => {
+    const fetcher = redirectFetcher((url) =>
+      url.hostname === "loop.public.net"
+        ? new Response(null, { status: 302, headers: { location: "https://www.loop.public.net/" } })
+        : new Response(null, { status: 307, headers: { location: "https://loop.public.net/" } }),
+    );
+    const result = await runLiveDiagnostics("loop.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "failed",
+      https: { classification: "redirect_loop", error: "Redirect loop detected." },
+    });
+  });
+
+  it("safely verifies a healthy external redirect", async () => {
+    const fetcher = redirectFetcher((url) =>
+      url.hostname === "external-source.public.net"
+        ? new Response(null, {
+            status: 308,
+            headers: { location: "https://destination.public.org/welcome" },
+          })
+        : new Response(null, { status: 204 }),
+    );
+    const result = await runLiveDiagnostics("external-source.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "healthy",
+      https: {
+        classification: "redirected",
+        finalUrl: "https://destination.public.org/welcome",
+      },
+    });
+  });
+
+  it("reports an unsafe redirect as detected but unverified", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.hostname === "cloudflare-dns.com") {
+        const name = url.searchParams.get("name")!;
+        const type = url.searchParams.get("type")!;
+        if (name === "unsafe.public.net" && type === "A") return dnsAnswer("A", name, "127.0.0.1");
+        return dnsResponse(type, name, "104.16.1.2");
+      }
+      if (url.hostname === "redirect.public.net")
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://unsafe.public.net/" },
+        });
+      throw new Error("Unsafe destination must not be requested");
+    });
+    const result = await runLiveDiagnostics("redirect.public.net", { fetcher });
+    expect(result).toMatchObject({
+      status: "degraded",
+      https: {
+        classification: "redirect_unverified",
+        redirects: [
+          { verified: false, reason: "Redirect target resolves to a non-public address." },
+        ],
+      },
+    });
+  });
 });
 
 describe("live diagnostic network safety", () => {
@@ -214,5 +292,20 @@ function dnsAnswer(type: string, hostname: string, value: string): Response {
   return Response.json({
     Status: 0,
     Answer: [{ name: `${hostname}.`, type: typeNumber[type], TTL: 300, data: value }],
+  });
+}
+
+function redirectFetcher(
+  httpsResponse: (url: URL, init?: RequestInit) => Response,
+): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(input.toString());
+    if (url.hostname === "cloudflare-dns.com")
+      return dnsResponse(
+        url.searchParams.get("type")!,
+        url.searchParams.get("name")!,
+        "104.16.1.2",
+      );
+    return httpsResponse(url, init);
   });
 }

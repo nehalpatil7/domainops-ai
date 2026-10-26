@@ -31,12 +31,23 @@ export type LiveHttpsObservation = {
   method?: "HEAD" | "GET";
   classification?:
     | "success"
-    | "redirect"
+    | "redirected"
+    | "redirect_unverified"
+    | "redirect_loop"
     | "client_error"
     | "server_error"
     | "network_error"
     | "skipped";
   url: string;
+  originalUrl?: string;
+  finalUrl?: string;
+  redirects?: Array<{
+    from: string;
+    to: string;
+    statusCode: number;
+    verified: boolean;
+    reason: string | null;
+  }>;
   statusCode: number | null;
   responseTimeMs: number | null;
   redirectLocation: string | null;

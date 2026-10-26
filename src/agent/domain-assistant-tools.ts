@@ -212,10 +212,12 @@ function buildDiagnosis(run: LiveDiagnosticRun) {
       "Verify HTTPS on port 443 and a publicly trusted certificate matching this hostname.",
     );
   }
-  if (run.https.redirectLocation)
+  if (run.https.classification === "redirect_unverified")
     nextSteps.push(
-      `Review the redirect to ${run.https.redirectLocation}; this probe records but does not follow redirects.`,
+      `Review the redirect to ${run.https.finalUrl ?? run.https.redirectLocation}; its destination could not be verified safely.`,
     );
+  if (run.https.classification === "redirect_loop")
+    nextSteps.push("Correct the redirect loop, then run another live check.");
   if (!possibleCauses.length)
     possibleCauses.push("No public DNS or HTTPS failure was observed in this snapshot.");
   if (!nextSteps.length)
