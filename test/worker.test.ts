@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { introspectWorkflow } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { DiagnosticEvent, Domain } from "../src/domain/types";
+import type { DiagnosticEvent, Domain, LiveDiagnosticRun } from "../src/domain/types";
 import worker from "../src/server";
 
 type Envelope<T> = { data: T; meta: { workspaceId: string; simulated: boolean } };
@@ -13,7 +13,10 @@ describe("Worker entry point", () => {
     await expect(response.json()).resolves.toEqual({
       service: "domainops-ai",
       status: "ok",
-      provider: "simulation",
+      modes: {
+        onboarding: "simulation",
+        diagnostics: "live_public",
+      },
     });
   });
 
@@ -171,6 +174,57 @@ describe("workspace domain API", () => {
       await workflow.dispose();
     }
   });
+
+  it("persists live observations separately and deduplicates diagnostic requests", async () => {
+    const workspace = uniqueWorkspace("live");
+    const registration = await request(workspace, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:live-mode" },
+      body: JSON.stringify({ hostname: "www.public-domain.com", simulationProfile: "active" }),
+    });
+    const domain = ((await registration.json()) as Envelope<{ domain: Domain }>).data.domain;
+    const store = env.WorkspaceDomainStore.get(env.WorkspaceDomainStore.idFromName(workspace));
+    const prepared = await store.prepareLiveDiagnostic(workspace, domain.id, "live:stable-request");
+    expect(prepared).toMatchObject({ ok: true, value: { shouldRun: true, duplicate: false } });
+    if (!prepared.ok) throw new Error(prepared.error.message);
+
+    const completed = await store.completeLiveDiagnostic(
+      workspace,
+      domain.id,
+      "live:stable-request",
+      prepared.value.requestId,
+      liveRun(domain, prepared.value.requestId),
+    );
+    expect(completed).toMatchObject({
+      ok: true,
+      value: { source: "live_public", hostname: domain.hostname, status: "healthy" },
+    });
+
+    const replay = await store.prepareLiveDiagnostic(workspace, domain.id, "live:stable-request");
+    expect(replay).toMatchObject({
+      ok: true,
+      value: { shouldRun: false, duplicate: true, existingRun: { source: "live_public" } },
+    });
+
+    const rateLimited = await store.prepareLiveDiagnostic(
+      workspace,
+      domain.id,
+      "live:new-request-key",
+    );
+    expect(rateLimited).toMatchObject({
+      ok: true,
+      value: { shouldRun: false, duplicate: false, existingRun: { id: prepared.value.requestId } },
+    });
+
+    const history = await request(workspace, `/${domain.id}/live-diagnostics`);
+    expect(history.status).toBe(200);
+    const payload = (await history.json()) as Envelope<LiveDiagnosticRun[]> & {
+      meta: { source: string; simulated: boolean; workspaceId: string };
+    };
+    expect(payload.meta).toMatchObject({ source: "live_public", simulated: false });
+    expect(payload.data).toHaveLength(1);
+    expect(JSON.stringify(payload.data)).not.toContain("requiredValidationRecords");
+  });
 });
 
 function uniqueWorkspace(prefix: string): string {
@@ -182,4 +236,39 @@ function request(workspace: string, path: string, init?: RequestInit): Promise<R
     new Request(`https://domainops.test/api/workspaces/${workspace}/domains${path}`, init),
     env,
   );
+}
+
+function liveRun(domain: Domain, id: string): LiveDiagnosticRun {
+  const now = new Date().toISOString();
+  return {
+    id,
+    workspaceId: "",
+    domainId: "",
+    hostname: domain.hostname,
+    source: "live_public",
+    status: "healthy",
+    observedAt: now,
+    completedAt: now,
+    durationMs: 1000,
+    dnsProvider: "Cloudflare DNS over HTTPS",
+    dns: [],
+    publicAddresses: ["104.16.1.2"],
+    safety: { allowed: true, blockedAddresses: [], reason: null },
+    https: {
+      status: "reachable",
+      url: `https://${domain.hostname}/`,
+      statusCode: 200,
+      responseTimeMs: 100,
+      redirectLocation: null,
+      headers: {},
+      error: null,
+    },
+    tls: {
+      handshake: "succeeded",
+      certificateMetadataAvailable: false,
+      limitation: "Certificate metadata unavailable in Workers fetch.",
+    },
+    findings: ["HTTPS reachable."],
+    limitations: ["Point-in-time observation."],
+  };
 }

@@ -4,6 +4,7 @@ import type {
   DiagnosticEvent,
   DnsRecord,
   Domain,
+  LiveDiagnosticRun,
   RevalidationOutcome,
   SimulationProfile,
   ValidationRecord,
@@ -52,6 +53,15 @@ type IdempotencyRow = {
   operation: string;
   request_json: string;
   response_json: string;
+};
+
+type LiveDiagnosticRow = {
+  result_json: string;
+};
+
+type LiveDiagnosticStateRow = {
+  active_request_id: string | null;
+  active_since: string | null;
 };
 
 export type NewDomain = Omit<Domain, "ready">;
@@ -124,6 +134,33 @@ export class DomainRepository {
         response_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY(workspace_id, idempotency_key)
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS live_diagnostic_runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        domain_id TEXT NOT NULL,
+        hostname TEXT NOT NULL,
+        status TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        FOREIGN KEY (domain_id) REFERENCES domains(id)
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS live_runs_by_workspace_domain
+      ON live_diagnostic_runs(workspace_id, domain_id, observed_at DESC, id DESC)
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS live_diagnostic_state (
+        workspace_id TEXT NOT NULL,
+        domain_id TEXT NOT NULL,
+        active_request_id TEXT,
+        active_since TEXT,
+        PRIMARY KEY(workspace_id, domain_id),
+        FOREIGN KEY (domain_id) REFERENCES domains(id)
       )
     `);
   }
@@ -341,6 +378,118 @@ export class DomainRepository {
       JSON.stringify(response),
       timestamp,
     );
+  }
+
+  updateIdempotencyResponse(
+    workspaceId: string,
+    key: string,
+    operation: string,
+    response: unknown,
+  ): void {
+    this.sql.exec(
+      `UPDATE idempotency_records SET response_json = ?
+       WHERE workspace_id = ? AND idempotency_key = ? AND operation = ?`,
+      JSON.stringify(response),
+      workspaceId,
+      key,
+      operation,
+    );
+  }
+
+  listLiveDiagnosticRuns(workspaceId: string, domainId: string, limit = 20): LiveDiagnosticRun[] {
+    return this.all<LiveDiagnosticRow>(
+      `SELECT result_json FROM live_diagnostic_runs
+       WHERE workspace_id = ? AND domain_id = ?
+       ORDER BY observed_at DESC, id DESC LIMIT ?`,
+      workspaceId,
+      domainId,
+      limit,
+    ).map((row) => JSON.parse(row.result_json) as LiveDiagnosticRun);
+  }
+
+  getLiveDiagnosticRun(
+    workspaceId: string,
+    domainId: string,
+    runId: string,
+  ): LiveDiagnosticRun | null {
+    const row = this.first<LiveDiagnosticRow>(
+      `SELECT result_json FROM live_diagnostic_runs
+       WHERE workspace_id = ? AND domain_id = ? AND id = ?`,
+      workspaceId,
+      domainId,
+      runId,
+    );
+    return row ? (JSON.parse(row.result_json) as LiveDiagnosticRun) : null;
+  }
+
+  insertLiveDiagnosticRun(run: LiveDiagnosticRun): void {
+    this.sql.exec(
+      `INSERT OR IGNORE INTO live_diagnostic_runs (
+        id, workspace_id, domain_id, hostname, status, observed_at, completed_at, result_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      run.id,
+      run.workspaceId,
+      run.domainId,
+      run.hostname,
+      run.status,
+      run.observedAt,
+      run.completedAt,
+      JSON.stringify(run),
+    );
+    this.sql.exec(
+      `DELETE FROM live_diagnostic_runs
+       WHERE workspace_id = ? AND domain_id = ? AND id NOT IN (
+         SELECT id FROM live_diagnostic_runs
+         WHERE workspace_id = ? AND domain_id = ?
+         ORDER BY observed_at DESC, id DESC LIMIT 50
+       )`,
+      run.workspaceId,
+      run.domainId,
+      run.workspaceId,
+      run.domainId,
+    );
+  }
+
+  acquireLiveDiagnostic(
+    workspaceId: string,
+    domainId: string,
+    requestId: string,
+    timestamp: string,
+    staleBefore: string,
+  ): boolean {
+    const current = this.first<LiveDiagnosticStateRow>(
+      `SELECT active_request_id, active_since FROM live_diagnostic_state
+       WHERE workspace_id = ? AND domain_id = ?`,
+      workspaceId,
+      domainId,
+    );
+    if (current?.active_request_id && current.active_since && current.active_since >= staleBefore) {
+      return false;
+    }
+    this.sql.exec(
+      `INSERT INTO live_diagnostic_state (
+        workspace_id, domain_id, active_request_id, active_since
+       ) VALUES (?, ?, ?, ?)
+       ON CONFLICT(workspace_id, domain_id) DO UPDATE SET
+       active_request_id = excluded.active_request_id,
+       active_since = excluded.active_since`,
+      workspaceId,
+      domainId,
+      requestId,
+      timestamp,
+    );
+    return true;
+  }
+
+  releaseLiveDiagnostic(workspaceId: string, domainId: string, requestId: string): boolean {
+    const cursor = this.sql.exec(
+      `UPDATE live_diagnostic_state SET active_request_id = NULL, active_since = NULL
+       WHERE workspace_id = ? AND domain_id = ? AND active_request_id = ?`,
+      workspaceId,
+      domainId,
+      requestId,
+    );
+    return cursor.rowsWritten > 0;
   }
 
   private all<T extends Record<string, SqlStorageValue>>(

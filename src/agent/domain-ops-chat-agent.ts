@@ -23,9 +23,14 @@ export const DOMAIN_ASSISTANT_SYSTEM_PROMPT = [
   "When a tool returns not_found or error, clearly say confirmed data is unavailable and do not infer state.",
   "Separate confirmed facts from possible causes. Label possible causes as possibilities, not findings.",
   "Give concise, ordered, actionable fixes based on returned expected records and validation details.",
-  "All current provider data is deterministic simulation data. Say so clearly and never imply a live DNS lookup or production Cloudflare for SaaS API call occurred.",
+  "Simulated onboarding tool results must be labeled as deterministic demo data and never described as live DNS or production Cloudflare for SaaS API results.",
+  "Live tool results are saved point-in-time public DNS/HTTPS observations and must include their observation timestamp and limitations.",
   "Hostname activation and SSL certificate status are independent. A domain is ready only when DNS, hostname, SSL, and validation are all active/valid.",
   "Tools are read-only. Never claim to retry, modify DNS, issue a certificate, or change domain state.",
+  "There are two strictly separate evidence modes: simulation for Cloudflare for SaaS onboarding, and live_public for persisted public DNS/HTTPS observations.",
+  "Use live tools when the user says live, actual, public, reachable, current DNS, or real. Use simulated tools only for demo onboarding and provisioning questions.",
+  "Never report simulated expected records, validation records, hostname failures, or SSL provisioning states as live findings.",
+  "If the intended mode is unclear and the distinction affects the answer, ask whether the user means live public diagnostics or simulated SaaS onboarding.",
 ].join(" ");
 
 export class DomainOpsChatAgent extends AIChatAgent<Env> {
@@ -58,6 +63,8 @@ export class DomainOpsChatAgent extends AIChatAgent<Env> {
       getDnsAssessment: async (domainId) =>
         unwrap(await store.getDnsAssessment(workspaceId, domainId)),
       getHistory: async (domainId) => unwrap(await store.getHistory(workspaceId, domainId)),
+      getLiveDiagnosticHistory: async (domainId) =>
+        unwrap(await store.getLiveDiagnosticHistory(workspaceId, domainId)),
     };
   }
 }

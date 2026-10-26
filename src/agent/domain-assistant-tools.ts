@@ -1,12 +1,13 @@
 import { tool } from "ai";
 import { z } from "zod";
-import type { DiagnosticEvent, DnsAssessment, Domain } from "../domain/types";
+import type { DiagnosticEvent, DnsAssessment, Domain, LiveDiagnosticRun } from "../domain/types";
 
 export interface DomainReadBackend {
   listDomains(): Promise<Domain[]>;
   getDomain(domainId: string): Promise<Domain>;
   getDnsAssessment(domainId: string): Promise<DnsAssessment>;
   getHistory(domainId: string): Promise<DiagnosticEvent[]>;
+  getLiveDiagnosticHistory(domainId: string): Promise<LiveDiagnosticRun[]>;
 }
 
 type Resolution =
@@ -140,6 +141,54 @@ export function createDomainToolHandlers(backend: DomainReadBackend) {
         ]);
         return buildDiagnosis(current, assessment, history);
       }),
+
+    getLiveDiagnostics: async ({ domain }: { domain: string }) =>
+      safely("getLiveDiagnostics", async () => {
+        const resolution = await resolveDomain(domain);
+        if (resolution.result !== "found") return unresolvedResponse(resolution);
+        const runs = await backend.getLiveDiagnosticHistory(resolution.domain.id);
+        return {
+          result: "success" as const,
+          source: "live_public" as const,
+          hostname: resolution.domain.hostname,
+          latest: runs[0] ?? null,
+          observationCount: runs.length,
+          instruction:
+            runs.length === 0
+              ? "Say no live observation has been run yet; do not substitute simulated onboarding data. Ask the user to run Live diagnostics from the dashboard."
+              : "Use only this live observation for public DNS and HTTPS claims. Do not combine it with simulated onboarding status.",
+        };
+      }),
+
+    getLiveDiagnosticHistory: async ({ domain }: { domain: string }) =>
+      safely("getLiveDiagnosticHistory", async () => {
+        const resolution = await resolveDomain(domain);
+        if (resolution.result !== "found") return unresolvedResponse(resolution);
+        const runs = await backend.getLiveDiagnosticHistory(resolution.domain.id);
+        return {
+          result: "success" as const,
+          source: "live_public" as const,
+          hostname: resolution.domain.hostname,
+          runs: runs.map(liveRunSummary),
+        };
+      }),
+
+    diagnoseLiveDomain: async ({ domain }: { domain: string }) =>
+      safely("diagnoseLiveDomain", async () => {
+        const resolution = await resolveDomain(domain);
+        if (resolution.result !== "found") return unresolvedResponse(resolution);
+        const run = (await backend.getLiveDiagnosticHistory(resolution.domain.id))[0];
+        if (!run) {
+          return {
+            result: "no_live_observation" as const,
+            source: "live_public" as const,
+            hostname: resolution.domain.hostname,
+            instruction:
+              "No live result exists. Ask the user to run Live diagnostics from the dashboard; do not use simulated findings as real observations.",
+          };
+        }
+        return buildLiveDiagnosis(run);
+      }),
   };
 }
 
@@ -148,7 +197,7 @@ export function createDomainAssistantTools(backend: DomainReadBackend) {
   return {
     listDomains: tool({
       description:
-        "List the workspace's domains using the DomainOps backend. Use for inventory, readiness, or when the user has not identified a domain.",
+        "List the workspace's registered domains and their SIMULATED SaaS onboarding readiness. Use for inventory or when the user has not identified a domain. This is not live public status.",
       inputSchema: z.object({
         readiness: z.enum(["all", "ready", "attention"]).default("all"),
       }),
@@ -156,19 +205,19 @@ export function createDomainAssistantTools(backend: DomainReadBackend) {
     }),
     getDomainStatus: tool({
       description:
-        "Get the confirmed current DNS, hostname, SSL, and aggregate validation status for one domain. The domain may be a full hostname, partial hostname, or ID.",
+        "Get the SIMULATED SaaS onboarding DNS, hostname, SSL, and validation status for one domain. This is not live public status.",
       inputSchema: z.object({ domain: z.string().min(1) }),
       execute: handlers.getDomainStatus,
     }),
     getDnsConfiguration: tool({
       description:
-        "Get confirmed expected and observed DNS plus hostname ownership and SSL certificate validation records for one domain.",
+        "Get SIMULATED expected/observed onboarding DNS plus fake demo hostname and certificate validation records. Never present these as live findings.",
       inputSchema: z.object({ domain: z.string().min(1) }),
       execute: handlers.getDnsConfiguration,
     }),
     getValidationHistory: tool({
       description:
-        "Get timestamped validation and diagnostic history for one domain. Use lastAttemptOnly for questions about the most recent attempt.",
+        "Get timestamped SIMULATED SaaS onboarding validation history. Use lastAttemptOnly for the latest simulated workflow attempt.",
       inputSchema: z.object({
         domain: z.string().min(1),
         lastAttemptOnly: z.boolean().default(false),
@@ -177,9 +226,27 @@ export function createDomainAssistantTools(backend: DomainReadBackend) {
     }),
     diagnoseDomain: tool({
       description:
-        "Diagnose one domain from current backend state, DNS evidence, SSL validation records, and history. Returns confirmed blockers separately from possible causes and recommended read-only troubleshooting steps.",
+        "Diagnose the SIMULATED Cloudflare for SaaS onboarding state for one domain. Returns confirmed simulated blockers separately from possible causes and actions. Never use for public/live DNS claims.",
       inputSchema: z.object({ domain: z.string().min(1) }),
       execute: handlers.diagnoseDomain,
+    }),
+    getLiveDiagnostics: tool({
+      description:
+        "Get the latest persisted LIVE PUBLIC DNS, HTTPS, and TLS observation for one domain. Use for words such as live, actual, public, current DNS, reachable, or real certificate. Does not return simulated validation records.",
+      inputSchema: z.object({ domain: z.string().min(1) }),
+      execute: handlers.getLiveDiagnostics,
+    }),
+    getLiveDiagnosticHistory: tool({
+      description:
+        "Get timestamped history of persisted LIVE PUBLIC diagnostic runs for one domain without using simulated onboarding events.",
+      inputSchema: z.object({ domain: z.string().min(1) }),
+      execute: handlers.getLiveDiagnosticHistory,
+    }),
+    diagnoseLiveDomain: tool({
+      description:
+        "Diagnose one domain using only its latest persisted LIVE PUBLIC DNS and HTTPS observation. Separates observed facts from possible causes and never reports simulated provisioning failures.",
+      inputSchema: z.object({ domain: z.string().min(1) }),
+      execute: handlers.diagnoseLiveDomain,
     }),
   };
 }
@@ -275,6 +342,64 @@ function buildDiagnosis(domain: Domain, dns: DnsAssessment, history: DiagnosticE
   };
 }
 
+function buildLiveDiagnosis(run: LiveDiagnosticRun) {
+  const confirmedFacts = [...run.findings];
+  const possibleCauses: string[] = [];
+  const recommendedActions: string[] = [];
+  const addressQueries = run.dns.filter((query) => query.type === "A" || query.type === "AAAA");
+  if (addressQueries.every((query) => query.status === "no_records")) {
+    possibleCauses.push(
+      "The hostname may not have a public address record or its DNS change may not have propagated.",
+    );
+    recommendedActions.push(
+      "Publish a public A, AAAA, or resolvable CNAME record and run live diagnostics again after propagation.",
+    );
+  }
+  if (run.safety.blockedAddresses.length) {
+    possibleCauses.push(
+      "The hostname may intentionally target a private service, which this public diagnostic mode does not access.",
+    );
+    recommendedActions.push(
+      "Use an external public hostname; private and internal network targets are intentionally blocked.",
+    );
+  }
+  if (run.https.status === "unreachable") {
+    possibleCauses.push(
+      "The public origin may be unavailable, filtering requests, or failing its TLS handshake.",
+    );
+    recommendedActions.push(
+      "Verify that the origin accepts HTTPS on port 443 with a publicly trusted certificate for this hostname.",
+    );
+  }
+  if (run.https.status === "reachable" && run.https.redirectLocation) {
+    recommendedActions.push(
+      `Review the observed redirect target ${run.https.redirectLocation}; redirects are not followed by this safety-limited probe.`,
+    );
+  }
+  if (!possibleCauses.length)
+    possibleCauses.push("No public DNS or HTTPS failure was observed in the latest snapshot.");
+  if (!recommendedActions.length)
+    recommendedActions.push(
+      "No corrective public DNS or HTTPS action is indicated; rerun diagnostics if conditions change.",
+    );
+  return {
+    result: "success" as const,
+    source: "live_public" as const,
+    hostname: run.hostname,
+    observedAt: run.observedAt,
+    status: run.status,
+    confirmedFacts,
+    possibleCauses,
+    recommendedActions,
+    dns: run.dns,
+    https: run.https,
+    tls: run.tls,
+    limitations: run.limitations,
+    instruction:
+      "Present the timestamp and label these as live public observations. Do not mention simulated validation records or internal provisioning status as findings.",
+  };
+}
+
 async function safely<T>(operation: string, action: () => Promise<T>) {
   try {
     return await action();
@@ -340,6 +465,20 @@ function eventSummary(event: DiagnosticEvent) {
     attempt: event.attempt,
     source: event.source,
     createdAt: event.createdAt,
+  };
+}
+
+function liveRunSummary(run: LiveDiagnosticRun) {
+  return {
+    id: run.id,
+    source: run.source,
+    status: run.status,
+    observedAt: run.observedAt,
+    completedAt: run.completedAt,
+    publicAddresses: run.publicAddresses,
+    https: run.https,
+    tls: run.tls,
+    findings: run.findings,
   };
 }
 

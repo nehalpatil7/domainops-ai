@@ -26,6 +26,12 @@ WorkspaceDomainStore (one SQLite Durable Object per workspace)
       |
       +-- deterministic simulation adapter
       |
+      +-- persisted live public observations
+      |          ^
+      |          |
+      |    Worker live diagnostics
+      |    Cloudflare DNS over HTTPS + HTTPS HEAD
+      |
       +-- DomainRevalidationWorkflow
              durable evaluate / delay / persist steps
 ```
@@ -49,7 +55,25 @@ Grounding is enforced at multiple layers:
 5. Deterministic diagnosis separates confirmed facts, possible causes, and actions.
 6. There are no mutating tools.
 
-Tool calls return `providerData: "simulation"` so the assistant cannot present them as live DNS or production Cloudflare for SaaS observations.
+Simulated tool calls return `providerData: "simulation"` so the assistant cannot present them as live DNS or production Cloudflare for SaaS observations.
+
+Live assistant tools instead return `source: "live_public"`, an observation timestamp, and only persisted public results. They never include expected SaaS DNS targets, validation records, hostname activation, or SSL provisioning state. If no live snapshot exists, the tool instructs the assistant to ask the user to run one from the dashboard rather than substituting simulation data.
+
+## Live diagnostic pipeline
+
+`POST .../live-diagnostics` uses three boundaries:
+
+1. `WorkspaceDomainStore` validates the domain, reserves one active run, enforces idempotency, and returns a result cached within the previous 30 seconds.
+2. The Worker queries Cloudflare's DNS-over-HTTPS JSON endpoint for exactly `A`, `AAAA`, `CNAME`, `TXT`, and `CAA` with per-request timeouts.
+3. Only when every observed address is public does the Worker send a non-redirecting HTTPS `HEAD` request to port 443. The completed result is written back through Durable Object RPC.
+
+`live_diagnostic_runs` stores the complete immutable JSON snapshot with observation/completion timestamps and retains the newest 50 snapshots per domain. `live_diagnostic_state` prevents concurrent runs for a domain and allows stale reservations to expire. The same workspace and domain predicates used elsewhere protect history reads.
+
+Safety checks reject reserved/internal hostname suffixes and non-public IPv4/IPv6 answers before HTTPS. Redirects are recorded without being followed. Response headers are allowlisted and length-bounded. The result records partial DNS failures and timeouts rather than converting unavailable data into negative findings.
+
+The application cannot pin Workers `fetch()` to the exact IP returned by the DNS-over-HTTPS preflight. The preflight and Cloudflare runtime outbound restrictions therefore work together as defense in depth against rebinding; production should also require authenticated, authorized workspaces and platform-level rate limiting.
+
+Workers `fetch()` exposes no peer certificate object. The TLS model therefore records only `succeeded`, `failed`, or `not_attempted`, and always includes the certificate-metadata limitation.
 
 ## Workspace isolation
 
@@ -137,7 +161,7 @@ Errors return:
 }
 ```
 
-Validation, not-found, conflict, and unexpected failures use consistent `4xx`/`5xx` codes. Provider-facing values and dashboard copy always identify the data source as simulated.
+Validation, not-found, conflict, and unexpected failures use consistent `4xx`/`5xx` codes. API metadata and dashboard copy identify results as either `simulation` or `live_public`; those sources are never merged into one status.
 
 ## Production extension points
 

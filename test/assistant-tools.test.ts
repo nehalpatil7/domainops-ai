@@ -8,10 +8,15 @@ import {
   DOMAIN_ASSISTANT_SYSTEM_PROMPT,
   prepareConversationMessages,
 } from "../src/agent/domain-ops-chat-agent";
-import type { DiagnosticEvent, DnsAssessment, Domain } from "../src/domain/types";
+import type {
+  DiagnosticEvent,
+  DnsAssessment,
+  Domain,
+  LiveDiagnosticRun,
+} from "../src/domain/types";
 
 describe("domain assistant tools", () => {
-  it("exposes exactly the five read-only backend tools", () => {
+  it("exposes only read-only simulated and live backend tools", () => {
     const tools = createDomainAssistantTools(fakeBackend());
     expect(Object.keys(tools)).toEqual([
       "listDomains",
@@ -19,6 +24,9 @@ describe("domain assistant tools", () => {
       "getDnsConfiguration",
       "getValidationHistory",
       "diagnoseDomain",
+      "getLiveDiagnostics",
+      "getLiveDiagnosticHistory",
+      "diagnoseLiveDomain",
     ]);
     expect(Object.keys(tools).some((name) => /retry|update|delete|register/i.test(name))).toBe(
       false,
@@ -118,6 +126,36 @@ describe("domain assistant tools", () => {
         "Explain that confirmed data is unavailable; do not infer or invent domain state.",
     });
   });
+
+  it("keeps live observations separate from simulated validation data", async () => {
+    const handlers = createDomainToolHandlers(fakeBackend());
+    const result = await handlers.getLiveDiagnostics({ domain: "active.demo.example" });
+    expect(result).toMatchObject({
+      result: "success",
+      source: "live_public",
+      latest: {
+        source: "live_public",
+        hostname: "active.demo.example",
+        https: { status: "reachable" },
+        tls: { certificateMetadataAvailable: false },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("requiredValidationRecords");
+    expect(JSON.stringify(result)).not.toContain("simulationProfile");
+  });
+
+  it("does not substitute simulation data when no live observation exists", async () => {
+    const backend = fakeBackend();
+    backend.getLiveDiagnosticHistory = async () => [];
+    const handlers = createDomainToolHandlers(backend);
+    await expect(
+      handlers.diagnoseLiveDomain({ domain: "active.demo.example" }),
+    ).resolves.toMatchObject({
+      result: "no_live_observation",
+      source: "live_public",
+      instruction: expect.stringMatching(/do not use simulated findings/i),
+    });
+  });
 });
 
 describe("assistant conversation context", () => {
@@ -153,6 +191,10 @@ describe("assistant conversation context", () => {
     expect(DOMAIN_ASSISTANT_SYSTEM_PROMPT).toMatch(/Every turn must use at least one tool/);
     expect(DOMAIN_ASSISTANT_SYSTEM_PROMPT).toMatch(/Separate confirmed facts from possible causes/);
     expect(DOMAIN_ASSISTANT_SYSTEM_PROMPT).toMatch(/Never invent a hostname/);
+    expect(DOMAIN_ASSISTANT_SYSTEM_PROMPT).toMatch(/two strictly separate evidence modes/);
+    expect(DOMAIN_ASSISTANT_SYSTEM_PROMPT).toMatch(
+      /Never report simulated expected records.*as live findings/,
+    );
   });
 });
 
@@ -183,6 +225,52 @@ function fakeBackend(): DomainReadBackend {
     getDomain: async (id) => domains.find((domain) => domain.id === id)!,
     getDnsAssessment: async (id) => makeAssessment(domains.find((domain) => domain.id === id)!),
     getHistory: async (id) => [makeEvent(id)],
+    getLiveDiagnosticHistory: async (id) => [
+      makeLiveRun(domains.find((domain) => domain.id === id)!),
+    ],
+  };
+}
+
+function makeLiveRun(domain: Domain): LiveDiagnosticRun {
+  return {
+    id: "44444444-4444-4444-8444-444444444444",
+    workspaceId: "tools-test",
+    domainId: domain.id,
+    hostname: domain.hostname,
+    source: "live_public",
+    status: "healthy",
+    observedAt: "2026-10-26T00:00:00.000Z",
+    completedAt: "2026-10-26T00:00:01.000Z",
+    durationMs: 1000,
+    dnsProvider: "Cloudflare DNS over HTTPS",
+    dns: [
+      {
+        type: "A",
+        status: "success",
+        responseCode: 0,
+        responseCodeName: "NOERROR",
+        records: [{ type: "A", name: domain.hostname, value: "104.16.1.2", ttl: 300 }],
+        error: null,
+      },
+    ],
+    publicAddresses: ["104.16.1.2"],
+    safety: { allowed: true, blockedAddresses: [], reason: null },
+    https: {
+      status: "reachable",
+      url: `https://${domain.hostname}/`,
+      statusCode: 200,
+      responseTimeMs: 80,
+      redirectLocation: null,
+      headers: { server: "cloudflare" },
+      error: null,
+    },
+    tls: {
+      handshake: "succeeded",
+      certificateMetadataAvailable: false,
+      limitation: "Workers fetch does not expose certificate metadata.",
+    },
+    findings: ["Observed one public A record.", "HTTPS responded with status 200."],
+    limitations: ["Point-in-time observation."],
   };
 }
 

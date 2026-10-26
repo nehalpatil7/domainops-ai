@@ -7,6 +7,8 @@ import type {
   DiagnosticEvent,
   DnsAssessment,
   Domain,
+  LiveDiagnosticRun,
+  PrepareLiveDiagnosticResult,
   RegisterDomainInput,
   RegisterDomainResult,
   RevalidationOutcome,
@@ -35,6 +37,46 @@ export class WorkspaceDomainStore extends DurableObject<Env> {
 
   getHistory(workspaceId: string, domainId: string): BackendResult<DiagnosticEvent[]> {
     return this.execute(workspaceId, (service) => service.getHistory(domainId));
+  }
+
+  getLiveDiagnosticHistory(
+    workspaceId: string,
+    domainId: string,
+  ): BackendResult<LiveDiagnosticRun[]> {
+    return this.execute(workspaceId, (service) => service.getLiveDiagnosticHistory(domainId));
+  }
+
+  prepareLiveDiagnostic(
+    workspaceId: string,
+    domainId: string,
+    idempotencyKey: string,
+  ): BackendResult<PrepareLiveDiagnosticResult> {
+    return this.execute(workspaceId, (service) =>
+      service.prepareLiveDiagnostic(domainId, idempotencyKey),
+    );
+  }
+
+  completeLiveDiagnostic(
+    workspaceId: string,
+    domainId: string,
+    idempotencyKey: string,
+    requestId: string,
+    result: LiveDiagnosticRun,
+  ): BackendResult<LiveDiagnosticRun> {
+    return this.execute(workspaceId, (service) =>
+      service.completeLiveDiagnostic(domainId, idempotencyKey, requestId, result),
+    );
+  }
+
+  failLiveDiagnostic(
+    workspaceId: string,
+    domainId: string,
+    idempotencyKey: string,
+    requestId: string,
+  ): BackendResult<void> {
+    return this.execute(workspaceId, (service) =>
+      service.failLiveDiagnostic(domainId, idempotencyKey, requestId),
+    );
   }
 
   registerDomain(

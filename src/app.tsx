@@ -7,6 +7,7 @@ import {
   type SimulationProfile,
 } from "./domain/types";
 import { ChatPanel } from "./chat-panel";
+import { LiveDiagnosticsPanel } from "./live-diagnostics-panel";
 
 type ApiEnvelope<T> = {
   data: T;
@@ -101,7 +102,10 @@ export default function App() {
           <div className="eyebrow">Cloudflare custom-domain control plane</div>
           <h1>DomainOps AI</h1>
         </div>
-        <span className="simulation-badge">Simulated provider data</span>
+        <div className="mode-badges">
+          <span className="simulation-badge">Simulated SaaS onboarding</span>
+          <span className="live-badge">Live public diagnostics</span>
+        </div>
       </header>
 
       {error ? (
@@ -205,7 +209,7 @@ export default function App() {
           <section className="panel detail-panel">
             <div className="panel-heading">
               <div>
-                <span>Domain details</span>
+                <span>Simulated SaaS onboarding</span>
                 <h2>{selected?.hostname ?? "Select a domain"}</h2>
               </div>
               {selected ? (
@@ -266,6 +270,7 @@ export default function App() {
               </div>
             )}
           </section>
+          <LiveDiagnosticsPanel domain={selected} workspaceId={workspaceId} />
           <ChatPanel key={workspaceId} workspaceId={workspaceId} />
         </div>
       </section>

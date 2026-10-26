@@ -5,6 +5,7 @@ import {
   validateIdempotencyKey,
   validateWorkspaceId,
 } from "../domain/validation";
+import { runLiveDiagnostics } from "../live/live-diagnostics";
 
 export async function handleDomainApi(request: Request, env: Env): Promise<Response> {
   const requestId = crypto.randomUUID();
@@ -48,6 +49,69 @@ export async function handleDomainApi(request: Request, env: Env): Promise<Respo
     }
     if (action === "history" && request.method === "GET") {
       return success(unwrap(await store.getHistory(workspaceId, domainId)), workspaceId, requestId);
+    }
+    if (action === "live-diagnostics" && request.method === "GET") {
+      return success(
+        unwrap(await store.getLiveDiagnosticHistory(workspaceId, domainId)),
+        workspaceId,
+        requestId,
+        200,
+        "live_public",
+      );
+    }
+    if (action === "live-diagnostics" && request.method === "POST") {
+      const idempotencyKey = validateIdempotencyKey(request.headers.get("Idempotency-Key"));
+      const preparation = unwrap(
+        await store.prepareLiveDiagnostic(workspaceId, domainId, idempotencyKey),
+      );
+      if (!preparation.shouldRun) {
+        return success(
+          {
+            run: preparation.existingRun,
+            duplicate: preparation.duplicate,
+            pending: preparation.existingRun === null,
+            cached: preparation.existingRun !== null,
+          },
+          workspaceId,
+          requestId,
+          preparation.existingRun ? 200 : 202,
+          "live_public",
+        );
+      }
+      try {
+        const observed = await runLiveDiagnostics(preparation.domain.hostname, {
+          requestId: preparation.requestId,
+        });
+        const run = unwrap(
+          await store.completeLiveDiagnostic(
+            workspaceId,
+            domainId,
+            idempotencyKey,
+            preparation.requestId,
+            observed,
+          ),
+        );
+        return success(
+          { run, duplicate: false, pending: false, cached: false },
+          workspaceId,
+          requestId,
+          201,
+          "live_public",
+        );
+      } catch (cause) {
+        await store.failLiveDiagnostic(
+          workspaceId,
+          domainId,
+          idempotencyKey,
+          preparation.requestId,
+        );
+        if (cause instanceof DomainError) throw cause;
+        throw new DomainError(
+          "LIVE_DIAGNOSTIC_FAILED",
+          "Live diagnostics could not be completed.",
+          502,
+        );
+      }
     }
     if (action === "revalidate" && request.method === "POST") {
       const idempotencyKey = validateIdempotencyKey(request.headers.get("Idempotency-Key"));
@@ -126,6 +190,15 @@ async function readJson(request: Request): Promise<unknown> {
   }
 }
 
-function success(data: unknown, workspaceId: string, requestId: string, status = 200): Response {
-  return Response.json({ data, meta: { workspaceId, simulated: true, requestId } }, { status });
+function success(
+  data: unknown,
+  workspaceId: string,
+  requestId: string,
+  status = 200,
+  source: "simulation" | "live_public" = "simulation",
+): Response {
+  return Response.json(
+    { data, meta: { workspaceId, simulated: source === "simulation", source, requestId } },
+    { status },
+  );
 }

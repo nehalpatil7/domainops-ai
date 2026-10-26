@@ -36,7 +36,7 @@ export function ChatPanel({ workspaceId }: { workspaceId: string }) {
         </button>
       </div>
       <div className="chat-notice">
-        Real Workers AI · read-only backend tools · provider results are simulated
+        Real Workers AI · read-only tools · simulated onboarding and live observations stay separate
       </div>
       <div className="messages" aria-live="polite">
         {messages.length === 0 ? (

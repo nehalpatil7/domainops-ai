@@ -7,6 +7,8 @@ import type {
   DnsAssessment,
   DnsRecord,
   Domain,
+  LiveDiagnosticRun,
+  PrepareLiveDiagnosticResult,
   RegisterDomainInput,
   RegisterDomainResult,
   RevalidationOutcome,
@@ -18,6 +20,7 @@ import {
   validateIdempotencyKey,
   validateWorkspaceId,
 } from "./validation";
+import { validateLiveHostname } from "../live/network-safety";
 
 const seededDomains: Array<{ hostname: string; profile: SimulationProfile }> = [
   { hostname: "active.demo.example", profile: "active" },
@@ -28,6 +31,12 @@ const seededDomains: Array<{ hostname: string; profile: SimulationProfile }> = [
 
 type StoredRegistration = { domainId: string };
 type StoredRevalidation = { domainId: string; workflowId: string; attempt: number };
+type StoredLiveDiagnostic = {
+  domainId: string;
+  requestId: string;
+  status: "pending" | "complete" | "failed";
+  runId: string | null;
+};
 
 export class DomainService {
   constructor(
@@ -52,6 +61,130 @@ export class DomainService {
   getHistory(domainId: string): DiagnosticEvent[] {
     const domain = this.getDomain(domainId);
     return this.repository.listEvents(this.workspaceId, domain.id);
+  }
+
+  getLiveDiagnosticHistory(domainId: string): LiveDiagnosticRun[] {
+    const domain = this.getDomain(domainId);
+    return this.repository.listLiveDiagnosticRuns(this.workspaceId, domain.id);
+  }
+
+  prepareLiveDiagnostic(domainId: string, idempotencyKey: string): PrepareLiveDiagnosticResult {
+    const domain = this.getDomain(domainId);
+    validateLiveHostname(domain.hostname);
+    const key = validateIdempotencyKey(idempotencyKey);
+    const requestJson = JSON.stringify({ domainId });
+    const stored = this.repository.getIdempotency<StoredLiveDiagnostic>(
+      this.workspaceId,
+      key,
+      "live_diagnostic",
+      requestJson,
+    );
+    if (stored) {
+      if (stored.status === "failed") {
+        throw DomainError.conflict(
+          "LIVE_DIAGNOSTIC_PREVIOUSLY_FAILED",
+          "This diagnostic request previously failed; retry with a new Idempotency-Key.",
+        );
+      }
+      return {
+        domain,
+        requestId: stored.requestId,
+        duplicate: true,
+        shouldRun: false,
+        existingRun:
+          stored.runId === null
+            ? null
+            : this.repository.getLiveDiagnosticRun(this.workspaceId, domain.id, stored.runId),
+      };
+    }
+
+    const now = new Date();
+    const latest = this.repository.listLiveDiagnosticRuns(this.workspaceId, domain.id, 1)[0];
+    if (latest && now.getTime() - new Date(latest.observedAt).getTime() < 30_000) {
+      this.repository.putIdempotency(
+        this.workspaceId,
+        key,
+        "live_diagnostic",
+        requestJson,
+        { domainId, requestId: latest.id, status: "complete", runId: latest.id },
+        now.toISOString(),
+      );
+      return {
+        domain,
+        requestId: latest.id,
+        duplicate: false,
+        shouldRun: false,
+        existingRun: latest,
+      };
+    }
+
+    const requestId = crypto.randomUUID();
+    const acquired = this.repository.acquireLiveDiagnostic(
+      this.workspaceId,
+      domain.id,
+      requestId,
+      now.toISOString(),
+      new Date(now.getTime() - 60_000).toISOString(),
+    );
+    if (!acquired) {
+      throw DomainError.conflict(
+        "LIVE_DIAGNOSTIC_IN_PROGRESS",
+        "A live diagnostic is already running for this domain.",
+      );
+    }
+    this.repository.putIdempotency(
+      this.workspaceId,
+      key,
+      "live_diagnostic",
+      requestJson,
+      { domainId, requestId, status: "pending", runId: null },
+      now.toISOString(),
+    );
+    return { domain, requestId, duplicate: false, shouldRun: true, existingRun: null };
+  }
+
+  completeLiveDiagnostic(
+    domainId: string,
+    idempotencyKey: string,
+    requestId: string,
+    result: LiveDiagnosticRun,
+  ): LiveDiagnosticRun {
+    const domain = this.getDomain(domainId);
+    const run: LiveDiagnosticRun = {
+      ...result,
+      id: requestId,
+      workspaceId: this.workspaceId,
+      domainId: domain.id,
+      hostname: domain.hostname,
+      source: "live_public",
+    };
+    if (!this.repository.releaseLiveDiagnostic(this.workspaceId, domain.id, requestId)) {
+      const existing = this.repository.getLiveDiagnosticRun(this.workspaceId, domain.id, requestId);
+      if (existing) return existing;
+      throw DomainError.conflict(
+        "STALE_LIVE_DIAGNOSTIC",
+        "This live diagnostic request is no longer active.",
+      );
+    }
+    this.repository.insertLiveDiagnosticRun(run);
+    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "live_diagnostic", {
+      domainId,
+      requestId,
+      status: "complete",
+      runId: run.id,
+    });
+    return run;
+  }
+
+  failLiveDiagnostic(domainId: string, idempotencyKey: string, requestId: string): void {
+    const domain = this.getDomain(domainId);
+    this.repository.releaseLiveDiagnostic(this.workspaceId, domain.id, requestId);
+    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "live_diagnostic", {
+      domainId,
+      requestId,
+      status: "failed",
+      runId: null,
+    });
   }
 
   assessDns(domainId: string): DnsAssessment {

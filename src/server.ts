@@ -13,7 +13,10 @@ export default {
       return Response.json({
         service: "domainops-ai",
         status: "ok",
-        provider: "simulation",
+        modes: {
+          onboarding: "simulation",
+          diagnostics: "live_public",
+        },
       });
     }
 
