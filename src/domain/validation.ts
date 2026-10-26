@@ -1,5 +1,5 @@
 import { DomainError } from "./errors";
-import { simulationProfiles, type RegisterDomainInput, type SimulationProfile } from "./types";
+import type { RegisterDomainInput } from "./types";
 
 const hostnamePattern =
   /^(?=.{1,253}\.?$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?$/i;
@@ -11,30 +11,26 @@ export function normalizeHostname(value: unknown, field = "hostname"): string {
   if (typeof value !== "string") throw DomainError.invalid(`${field} must be a string.`);
   const hostname = value.trim().toLowerCase().replace(/\.$/, "");
   if (!hostnamePattern.test(hostname)) {
-    throw DomainError.invalid(`${field} must be a valid fully-qualified hostname.`, { field });
+    throw DomainError.invalid(`${field} must be a valid ASCII fully-qualified hostname.`, {
+      field,
+    });
   }
   return hostname;
 }
-
 export function validateWorkspaceId(value: string): string {
   if (!workspacePattern.test(value)) {
     throw DomainError.invalid(
       "workspaceId must be 1-64 lowercase letters, numbers, underscores, or hyphens.",
-      {
-        field: "workspaceId",
-      },
+      { field: "workspaceId" },
     );
   }
   return value;
 }
-
 export function validateDomainId(value: string): string {
-  if (!identifierPattern.test(value)) {
+  if (!identifierPattern.test(value))
     throw DomainError.invalid("domainId must be a UUID.", { field: "domainId" });
-  }
   return value;
 }
-
 export function validateIdempotencyKey(value: string | null): string {
   if (!value || !idempotencyPattern.test(value)) {
     throw DomainError.invalid("Idempotency-Key must be 8-128 URL-safe characters.", {
@@ -43,42 +39,15 @@ export function validateIdempotencyKey(value: string | null): string {
   }
   return value;
 }
-
-export function parseRegisterDomainInput(value: unknown): Omit<
-  Required<RegisterDomainInput>,
-  "observedDnsRecord"
-> & {
-  observedDnsRecord: string | null | undefined;
-} {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+export function parseRegisterDomainInput(value: unknown): RegisterDomainInput {
+  if (!value || typeof value !== "object" || Array.isArray(value))
     throw DomainError.invalid("Request body must be a JSON object.");
-  }
-  const input = value as Record<string, unknown>;
-  const hostname = normalizeHostname(input.hostname);
-  const expectedDnsTarget = normalizeHostname(
-    input.expectedDnsTarget ?? "customers.domainops.example",
-    "expectedDnsTarget",
-  );
-  const observedDnsRecord =
-    input.observedDnsRecord === undefined
-      ? undefined
-      : input.observedDnsRecord === null
-        ? null
-        : normalizeHostname(input.observedDnsRecord, "observedDnsRecord");
-  const simulationProfile = input.simulationProfile ?? "pending_ssl";
-  if (
-    typeof simulationProfile !== "string" ||
-    !simulationProfiles.includes(simulationProfile as SimulationProfile)
-  ) {
-    throw DomainError.invalid("simulationProfile is not supported.", {
-      allowed: [...simulationProfiles],
-    });
-  }
-
-  return {
-    hostname,
-    expectedDnsTarget,
-    observedDnsRecord,
-    simulationProfile: simulationProfile as SimulationProfile,
-  };
+  return { hostname: normalizeHostname((value as Record<string, unknown>).hostname) };
+}
+export function validateWorkspaceName(value: unknown): string {
+  if (typeof value !== "string") throw DomainError.invalid("name must be a string.");
+  const name = value.trim().replace(/\s+/g, " ");
+  if (name.length < 1 || name.length > 80)
+    throw DomainError.invalid("Workspace name must contain 1-80 characters.", { field: "name" });
+  return name;
 }

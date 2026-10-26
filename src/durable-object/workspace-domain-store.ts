@@ -1,23 +1,19 @@
 import { DurableObject } from "cloudflare:workers";
+import { toBackendError } from "../domain/errors";
 import { DomainRepository } from "../domain/repository";
 import { DomainService } from "../domain/service";
 import type {
   BackendResult,
-  BeginRevalidationResult,
-  DiagnosticEvent,
-  DnsAssessment,
+  DiagnosticHistoryItem,
   Domain,
   LiveDiagnosticRun,
   PrepareLiveDiagnosticResult,
   RegisterDomainInput,
   RegisterDomainResult,
-  RevalidationOutcome,
 } from "../domain/types";
-import { toBackendError } from "../domain/errors";
 
 export class WorkspaceDomainStore extends DurableObject<Env> {
   private readonly repository: DomainRepository;
-
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.repository = new DomainRepository(ctx.storage.sql);
@@ -26,99 +22,47 @@ export class WorkspaceDomainStore extends DurableObject<Env> {
   listDomains(workspaceId: string): BackendResult<Domain[]> {
     return this.execute(workspaceId, (service) => service.listDomains());
   }
-
   getDomain(workspaceId: string, domainId: string): BackendResult<Domain> {
     return this.execute(workspaceId, (service) => service.getDomain(domainId));
   }
-
-  getDnsAssessment(workspaceId: string, domainId: string): BackendResult<DnsAssessment> {
-    return this.execute(workspaceId, (service) => service.assessDns(domainId));
-  }
-
-  getHistory(workspaceId: string, domainId: string): BackendResult<DiagnosticEvent[]> {
-    return this.execute(workspaceId, (service) => service.getHistory(domainId));
-  }
-
-  getLiveDiagnosticHistory(
+  getDiagnosticHistory(
     workspaceId: string,
     domainId: string,
-  ): BackendResult<LiveDiagnosticRun[]> {
-    return this.execute(workspaceId, (service) => service.getLiveDiagnosticHistory(domainId));
+  ): BackendResult<DiagnosticHistoryItem[]> {
+    return this.execute(workspaceId, (service) => service.getDiagnosticHistory(domainId));
   }
-
-  prepareLiveDiagnostic(
+  registerDomain(
+    workspaceId: string,
+    input: RegisterDomainInput | unknown,
+    key: string,
+  ): BackendResult<RegisterDomainResult> {
+    return this.execute(workspaceId, (service) => service.registerDomain(input, key));
+  }
+  prepareDiagnostic(
     workspaceId: string,
     domainId: string,
-    idempotencyKey: string,
+    key: string,
   ): BackendResult<PrepareLiveDiagnosticResult> {
-    return this.execute(workspaceId, (service) =>
-      service.prepareLiveDiagnostic(domainId, idempotencyKey),
-    );
+    return this.execute(workspaceId, (service) => service.prepareDiagnostic(domainId, key));
   }
-
-  completeLiveDiagnostic(
+  completeDiagnostic(
     workspaceId: string,
     domainId: string,
-    idempotencyKey: string,
+    key: string,
     requestId: string,
     result: LiveDiagnosticRun,
   ): BackendResult<LiveDiagnosticRun> {
     return this.execute(workspaceId, (service) =>
-      service.completeLiveDiagnostic(domainId, idempotencyKey, requestId, result),
+      service.completeDiagnostic(domainId, key, requestId, result),
     );
   }
-
-  failLiveDiagnostic(
+  failDiagnostic(
     workspaceId: string,
     domainId: string,
-    idempotencyKey: string,
+    key: string,
     requestId: string,
   ): BackendResult<void> {
-    return this.execute(workspaceId, (service) =>
-      service.failLiveDiagnostic(domainId, idempotencyKey, requestId),
-    );
-  }
-
-  registerDomain(
-    workspaceId: string,
-    input: RegisterDomainInput | unknown,
-    idempotencyKey: string,
-  ): BackendResult<RegisterDomainResult> {
-    return this.execute(workspaceId, (service) => service.registerDomain(input, idempotencyKey));
-  }
-
-  beginRevalidation(
-    workspaceId: string,
-    domainId: string,
-    idempotencyKey: string,
-  ): BackendResult<BeginRevalidationResult> {
-    return this.execute(workspaceId, (service) =>
-      service.beginRevalidation(domainId, idempotencyKey),
-    );
-  }
-
-  applyRevalidationResult(
-    workspaceId: string,
-    domainId: string,
-    validationId: string,
-    attempt: number,
-    outcome: RevalidationOutcome,
-  ): BackendResult<Domain> {
-    return this.execute(workspaceId, (service) =>
-      service.applyRevalidationResult(domainId, validationId, attempt, outcome),
-    );
-  }
-
-  failRevalidationStart(
-    workspaceId: string,
-    domainId: string,
-    validationId: string,
-    attempt: number,
-    message: string,
-  ): BackendResult<Domain> {
-    return this.execute(workspaceId, (service) =>
-      service.failRevalidationStart(domainId, validationId, attempt, message),
-    );
+    return this.execute(workspaceId, (service) => service.failDiagnostic(domainId, key, requestId));
   }
 
   private execute<T>(workspaceId: string, action: (service: DomainService) => T): BackendResult<T> {

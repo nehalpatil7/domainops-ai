@@ -15,6 +15,10 @@
         "name": "DomainOpsChatAgent",
         "class_name": "DomainOpsChatAgent",
       },
+      {
+        "name": "WorkspaceCatalog",
+        "class_name": "WorkspaceCatalog",
+      },
     ],
   },
   "migrations": [
@@ -26,12 +30,9 @@
       "tag": "v2",
       "new_sqlite_classes": ["DomainOpsChatAgent"],
     },
-  ],
-  "workflows": [
     {
-      "name": "domain-revalidation-workflow-test",
-      "binding": "DOMAIN_REVALIDATION_WORKFLOW",
-      "class_name": "DomainRevalidationWorkflow",
+      "tag": "v3",
+      "new_sqlite_classes": ["WorkspaceCatalog"],
     },
   ],
 }

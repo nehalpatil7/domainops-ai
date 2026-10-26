@@ -1,183 +1,248 @@
 import { useEffect, useState } from "react";
-import type { Domain, LiveDiagnosticRun } from "./domain/types";
+import type { DiagnosticHistoryItem, Domain } from "./domain/types";
 
-type ApiEnvelope<T> = { data: T; error?: { message: string } };
-
-export function LiveDiagnosticsPanel({
-  workspaceId,
-  domain,
-}: {
+type Props = {
   workspaceId: string;
   domain: Domain | null;
-}) {
-  const [runs, setRuns] = useState<LiveDiagnosticRun[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const liveAllowed = Boolean(domain && !isReservedDemoHostname(domain.hostname));
+  checking: boolean;
+  onRun(domain: Domain): Promise<void>;
+  onUpdated(): Promise<void>;
+};
 
+export function LiveDiagnosticsPanel({ workspaceId, domain, checking, onRun, onUpdated }: Props) {
+  const [runs, setRuns] = useState<DiagnosticHistoryItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     setRuns([]);
     setError(null);
     if (!domain) return;
-    void loadHistory(workspaceId, domain.id)
+    setLoading(true);
+    void load(workspaceId, domain.id)
       .then(setRuns)
-      .catch((cause) => setError(message(cause)));
+      .catch((cause) => setError(message(cause)))
+      .finally(() => setLoading(false));
   }, [domain?.id, workspaceId]);
 
-  async function runDiagnostics() {
+  async function run() {
     if (!domain) return;
-    setBusy(true);
-    setError(null);
     try {
-      const response = await api<{
-        run: LiveDiagnosticRun | null;
-        pending: boolean;
-      }>(`/api/workspaces/${workspaceId}/domains/${domain.id}/live-diagnostics`, {
-        method: "POST",
-        headers: { "Idempotency-Key": `live:${crypto.randomUUID()}` },
-      });
-      if (response.run) setRuns(await loadHistory(workspaceId, domain.id));
-      if (response.pending)
-        setError("A live diagnostic is already in progress. Try again shortly.");
+      await onRun(domain);
+      setRuns(await load(workspaceId, domain.id));
+      await onUpdated();
     } catch (cause) {
       setError(message(cause));
-    } finally {
-      setBusy(false);
     }
   }
 
-  const latest = runs[0];
-  return (
-    <section className="panel live-panel">
-      <div className="panel-heading">
-        <div>
-          <span>Live public observations</span>
-          <h2>DNS &amp; HTTPS diagnostics</h2>
+  if (!domain)
+    return (
+      <section className="panel details-panel">
+        <div className="empty-state large">
+          <span>⌁</span>
+          <h3>Select a domain</h3>
+          <p>Choose a hostname to inspect its latest observations and check history.</p>
         </div>
-        <button
-          className="primary"
-          disabled={!domain || !liveAllowed || busy}
-          onClick={() => void runDiagnostics()}
-        >
-          {busy ? "Checking…" : "Run live diagnostics"}
+      </section>
+    );
+  const latest = runs[0] ?? domain.latestDiagnostic;
+  return (
+    <section className="panel details-panel">
+      <div className="panel-heading detail-heading">
+        <div>
+          <p className="eyebrow">
+            Public diagnostics{" "}
+            <Info text="Point-in-time public DNS and HTTPS observations. This is not Cloudflare for SaaS activation status." />
+          </p>
+          <h2>{domain.hostname}</h2>
+        </div>
+        <button className="primary" disabled={checking} onClick={() => void run()}>
+          {checking ? "Checking…" : "Run live check"}
         </button>
       </div>
-      <div className="live-notice">
-        Uses Cloudflare DNS over HTTPS and a safety-limited HTTPS HEAD request. Results below are
-        never simulated.
-      </div>
-      {!domain ? (
-        <div className="empty">Select a domain to view or run public diagnostics.</div>
-      ) : !liveAllowed ? (
-        <div className="empty">
-          Reserved <code>.example</code> demo hostnames cannot be probed. Register a public hostname
-          to use live mode.
-        </div>
+      {loading ? (
+        <div className="detail-loading">Loading diagnostic history…</div>
       ) : latest ? (
-        <div className="live-results">
-          <div className="live-summary">
-            <strong className={`live-${latest.status}`}>{latest.status}</strong>
-            <span>Observed {formatTime(latest.observedAt)}</span>
-            <span>Source: {latest.dnsProvider}</span>
+        <div className="diagnostic-content">
+          <div className="summary-strip">
+            <Status status={latest.status} />
+            <div>
+              <span>Last checked</span>
+              <strong>{formatTime(latest.observedAt)}</strong>
+            </div>
+            <div>
+              <span>Duration</span>
+              <strong>{latest.durationMs} ms</strong>
+            </div>
+            <div>
+              <span>Freshness</span>
+              <strong>{freshness(latest.observedAt)}</strong>
+            </div>
           </div>
-          <h3>Public DNS</h3>
-          <div className="live-dns-grid">
-            {latest.dns.map((query) => (
-              <div className="live-dns-card" key={query.type}>
-                <div>
-                  <b>{query.type}</b>
-                  <span>{query.status.replaceAll("_", " ")}</span>
-                </div>
-                {query.records
-                  .filter((record) => record.type === query.type)
-                  .map((record) => (
-                    <code key={`${record.name}:${record.value}`}>{record.value}</code>
-                  ))}
-                {query.error ? <small>{query.error}</small> : null}
-              </div>
-            ))}
-          </div>
-          <h3>HTTPS &amp; TLS</h3>
-          <div className="live-observation">
-            <Fact label="Reachability" value={latest.https.status} />
-            <Fact
-              label="HTTP status"
-              value={latest.https.statusCode?.toString() ?? "Unavailable"}
-            />
-            <Fact
-              label="Response time"
-              value={
-                latest.https.responseTimeMs === null
-                  ? "Unavailable"
-                  : `${latest.https.responseTimeMs} ms`
-              }
-            />
-            <Fact label="TLS handshake" value={latest.tls.handshake} />
-          </div>
-          {latest.https.redirectLocation ? (
-            <p className="live-detail">
-              Redirect observed, not followed: <code>{latest.https.redirectLocation}</code>
-            </p>
+          {latest.findings.length ? (
+            <section>
+              <h3>Observed findings</h3>
+              <ul className="findings">
+                {latest.findings.map((finding) => (
+                  <li key={finding}>{finding}</li>
+                ))}
+              </ul>
+            </section>
           ) : null}
-          <p className="live-limitation">{latest.tls.limitation}</p>
-          <h3>Saved observations</h3>
-          <ol className="live-history">
-            {runs.map((run) => (
-              <li key={run.id}>
-                <b>{run.status}</b>
-                <span>{formatTime(run.observedAt)}</span>
-                <span>
-                  {run.https.status === "reachable"
-                    ? `HTTPS ${run.https.statusCode}`
-                    : run.https.status}
-                </span>
-              </li>
-            ))}
-          </ol>
+          <section>
+            <h3>
+              Public DNS{" "}
+              <Info text="Queries use Cloudflare's DNS-over-HTTPS resolver. Empty or timed-out answers are preserved as partial observations." />
+            </h3>
+            <div className="dns-grid">
+              {latest.dns.map((query) => (
+                <div className={`dns-card dns-${query.status}`} key={query.type}>
+                  <header>
+                    <b>{query.type}</b>
+                    <span>{query.status.replaceAll("_", " ")}</span>
+                  </header>
+                  {query.records
+                    .filter((record) => record.type === query.type)
+                    .map((record) => (
+                      <code key={`${record.name}:${record.value}`}>{record.value}</code>
+                    ))}
+                  {query.error ? (
+                    <small>{query.error}</small>
+                  ) : !query.records.length ? (
+                    <small>No records observed</small>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </section>
+          <section>
+            <h3>
+              HTTPS &amp; TLS{" "}
+              <Info text="A HEAD request checks HTTPS reachability and handshake success. Workers do not expose certificate issuer, SAN, or expiry metadata." />
+            </h3>
+            <div className="observation-grid">
+              <Fact label="Reachability" value={latest.https.status} />
+              <Fact
+                label="HTTP status"
+                value={latest.https.statusCode?.toString() ?? "Unavailable"}
+              />
+              <Fact
+                label="Response time"
+                value={
+                  latest.https.responseTimeMs === null
+                    ? "Unavailable"
+                    : `${latest.https.responseTimeMs} ms`
+                }
+              />
+              <Fact label="TLS handshake" value={latest.tls.handshake} />
+            </div>
+            {latest.https.redirectLocation ? (
+              <p className="callout">
+                Redirect observed (not followed): <code>{latest.https.redirectLocation}</code>
+              </p>
+            ) : null}
+            <p className="limitation">{latest.tls.limitation}</p>
+          </section>
+          <section>
+            <h3>Check history</h3>
+            <div className="timeline">
+              {runs.map((item) => (
+                <article key={item.id}>
+                  <i className={`timeline-dot live-${item.status}`} />
+                  <div>
+                    <header>
+                      <b>{label(item.status)}</b>
+                      <time>{formatTime(item.observedAt)}</time>
+                    </header>
+                    <p>
+                      {item.https.status === "reachable"
+                        ? `HTTPS ${item.https.statusCode}`
+                        : `HTTPS ${item.https.status}`}{" "}
+                      · {item.durationMs} ms
+                    </p>
+                    {item.changes.length ? (
+                      <ul className="changes">
+                        {item.changes.map((change) => (
+                          <li key={`${change.area}:${change.message}`}>{change.message}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <small>
+                        {runs.at(-1)?.id === item.id
+                          ? "Baseline observation"
+                          : "No meaningful change"}
+                      </small>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
         </div>
       ) : (
-        <div className="empty">No live observations saved for {domain.hostname}.</div>
-      )}
-      {error ? (
-        <div className="inline-error" role="alert">
-          {error}
+        <div className="empty-state large">
+          <span>◌</span>
+          <h3>No observations yet</h3>
+          <p>
+            Run the first live check to inspect public DNS, HTTPS reachability, and TLS handshake
+            health.
+          </p>
+          <button className="primary" onClick={() => void run()}>
+            Run first check
+          </button>
         </div>
-      ) : null}
+      )}
+      {error ? <div className="inline-error">{error}</div> : null}
     </section>
   );
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
+function Info({ text }: { text: string }) {
+  return (
+    <span className="info-tip" tabIndex={0} aria-label={text}>
+      i<span role="tooltip">{text}</span>
+    </span>
+  );
+}
+function Fact({ label: name, value }: { label: string; value: string }) {
   return (
     <div>
-      <span>{label}</span>
-      <b>{value.replaceAll("_", " ")}</b>
+      <span>{name}</span>
+      <strong>{label(value)}</strong>
     </div>
   );
 }
-
-function isReservedDemoHostname(hostname: string): boolean {
-  return hostname === "example" || hostname.endsWith(".example");
+function Status({ status }: { status: "healthy" | "degraded" | "failed" }) {
+  return (
+    <div className={`result-status live-${status}`}>
+      <span>Result</span>
+      <strong>{status === "healthy" ? "Healthy" : "Needs attention"}</strong>
+    </div>
+  );
 }
-
-function formatTime(value: string): string {
+function label(value: string) {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+function formatTime(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
     new Date(value),
   );
 }
-
-function message(cause: unknown): string {
-  return cause instanceof Error ? cause.message : "Live diagnostics failed.";
+function freshness(value: string) {
+  const ms = Date.now() - new Date(value).getTime();
+  if (ms < 300_000) return "Fresh";
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m old`;
+  return `${Math.floor(ms / 3_600_000)}h old`;
 }
-
-async function loadHistory(workspaceId: string, domainId: string): Promise<LiveDiagnosticRun[]> {
-  return api(`/api/workspaces/${workspaceId}/domains/${domainId}/live-diagnostics`);
+function message(cause: unknown) {
+  return cause instanceof Error ? cause.message : "Could not load diagnostics.";
 }
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
-  const payload = (await response.json()) as ApiEnvelope<T>;
-  if (!response.ok)
-    throw new Error(payload.error?.message ?? `Request failed (${response.status}).`);
+async function load(workspaceId: string, domainId: string) {
+  const response = await fetch(`/api/workspaces/${workspaceId}/domains/${domainId}/diagnostics`);
+  const payload = (await response.json()) as {
+    data: DiagnosticHistoryItem[];
+    error?: { message: string };
+  };
+  if (!response.ok) throw new Error(payload.error?.message ?? "Could not load diagnostics.");
   return payload.data;
 }

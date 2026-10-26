@@ -3,7 +3,7 @@ import { handleDomainApi } from "./api/domain-api";
 
 export { DomainOpsChatAgent } from "./agent/domain-ops-chat-agent";
 export { WorkspaceDomainStore } from "./durable-object/workspace-domain-store";
-export { DomainRevalidationWorkflow } from "./workflows/domain-revalidation-workflow";
+export { WorkspaceCatalog } from "./durable-object/workspace-catalog";
 
 export default {
   async fetch(request: Request, env: Env) {
@@ -13,14 +13,11 @@ export default {
       return Response.json({
         service: "domainops-ai",
         status: "ok",
-        modes: {
-          onboarding: "simulation",
-          diagnostics: "live_public",
-        },
+        mode: "live_public",
       });
     }
 
-    if (url.pathname.startsWith("/api/workspaces/")) {
+    if (url.pathname === "/api/workspaces" || url.pathname.startsWith("/api/workspaces/")) {
       return handleDomainApi(request, env);
     }
 

@@ -1,18 +1,13 @@
 import { DomainError } from "./errors";
 import { DomainRepository, type NewDomain } from "./repository";
-import { initialSimulationState } from "./simulation";
 import type {
-  BeginRevalidationResult,
-  DiagnosticEvent,
-  DnsAssessment,
-  DnsRecord,
+  DiagnosticChange,
+  DiagnosticHistoryItem,
   Domain,
   LiveDiagnosticRun,
   PrepareLiveDiagnosticResult,
   RegisterDomainInput,
   RegisterDomainResult,
-  RevalidationOutcome,
-  SimulationProfile,
 } from "./types";
 import {
   parseRegisterDomainInput,
@@ -22,16 +17,8 @@ import {
 } from "./validation";
 import { validateLiveHostname } from "../live/network-safety";
 
-const seededDomains: Array<{ hostname: string; profile: SimulationProfile }> = [
-  { hostname: "active.demo.example", profile: "active" },
-  { hostname: "incorrect-dns.demo.example", profile: "incorrect_dns" },
-  { hostname: "pending-ssl.demo.example", profile: "pending_ssl" },
-  { hostname: "validation-failure.demo.example", profile: "validation_failure" },
-];
-
 type StoredRegistration = { domainId: string };
-type StoredRevalidation = { domainId: string; workflowId: string; attempt: number };
-type StoredLiveDiagnostic = {
+type StoredDiagnostic = {
   domainId: string;
   requestId: string;
   status: "pending" | "complete" | "failed";
@@ -46,67 +33,107 @@ export class DomainService {
     validateWorkspaceId(workspaceId);
     repository.ensureSchema();
     repository.bindWorkspace(workspaceId);
-    this.seedDemoDomains();
   }
 
   listDomains(): Domain[] {
     return this.repository.listDomains(this.workspaceId);
   }
-
   getDomain(domainId: string): Domain {
     validateDomainId(domainId);
-    return this.getDomainOrThrow(domainId);
+    const domain = this.repository.getDomain(this.workspaceId, domainId);
+    if (!domain) throw DomainError.notFound();
+    return domain;
   }
-
-  getHistory(domainId: string): DiagnosticEvent[] {
+  getDiagnosticHistory(domainId: string): DiagnosticHistoryItem[] {
     const domain = this.getDomain(domainId);
-    return this.repository.listEvents(this.workspaceId, domain.id);
+    const runs = this.repository.listDiagnosticRuns(this.workspaceId, domain.id);
+    return runs.map((run, index) => ({ ...run, changes: compareRuns(runs[index + 1], run) }));
   }
 
-  getLiveDiagnosticHistory(domainId: string): LiveDiagnosticRun[] {
-    const domain = this.getDomain(domainId);
-    return this.repository.listLiveDiagnosticRuns(this.workspaceId, domain.id);
+  registerDomain(
+    input: RegisterDomainInput | unknown,
+    idempotencyKey: string,
+  ): RegisterDomainResult {
+    const key = validateIdempotencyKey(idempotencyKey);
+    const parsed = parseRegisterDomainInput(input);
+    validateLiveHostname(parsed.hostname);
+    const requestJson = JSON.stringify(parsed);
+    const stored = this.repository.getIdempotency<StoredRegistration>(
+      this.workspaceId,
+      key,
+      "register_domain",
+      requestJson,
+    );
+    if (stored) return { domain: this.getDomain(stored.domainId), duplicate: true };
+    if (this.repository.getDomainByHostname(this.workspaceId, parsed.hostname)) {
+      throw DomainError.conflict(
+        "DOMAIN_ALREADY_EXISTS",
+        "Hostname is already registered in this workspace.",
+        { hostname: parsed.hostname },
+      );
+    }
+    const now = new Date().toISOString();
+    const domain: NewDomain = {
+      id: crypto.randomUUID(),
+      workspaceId: this.workspaceId,
+      hostname: parsed.hostname,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.repository.insertDomain(domain);
+    this.repository.putIdempotency(
+      this.workspaceId,
+      key,
+      "register_domain",
+      requestJson,
+      { domainId: domain.id },
+      now,
+    );
+    return { domain: this.getDomain(domain.id), duplicate: false };
   }
 
-  prepareLiveDiagnostic(domainId: string, idempotencyKey: string): PrepareLiveDiagnosticResult {
+  prepareDiagnostic(domainId: string, idempotencyKey: string): PrepareLiveDiagnosticResult {
     const domain = this.getDomain(domainId);
     validateLiveHostname(domain.hostname);
     const key = validateIdempotencyKey(idempotencyKey);
     const requestJson = JSON.stringify({ domainId });
-    const stored = this.repository.getIdempotency<StoredLiveDiagnostic>(
+    const stored = this.repository.getIdempotency<StoredDiagnostic>(
       this.workspaceId,
       key,
-      "live_diagnostic",
+      "diagnostic",
       requestJson,
     );
     if (stored) {
-      if (stored.status === "failed") {
+      if (stored.status === "failed")
         throw DomainError.conflict(
-          "LIVE_DIAGNOSTIC_PREVIOUSLY_FAILED",
+          "DIAGNOSTIC_PREVIOUSLY_FAILED",
           "This diagnostic request previously failed; retry with a new Idempotency-Key.",
         );
-      }
       return {
         domain,
         requestId: stored.requestId,
         duplicate: true,
         shouldRun: false,
-        existingRun:
-          stored.runId === null
-            ? null
-            : this.repository.getLiveDiagnosticRun(this.workspaceId, domain.id, stored.runId),
+        existingRun: stored.runId
+          ? this.repository.getDiagnosticRun(this.workspaceId, domain.id, stored.runId)
+          : null,
       };
     }
-
     const now = new Date();
-    const latest = this.repository.listLiveDiagnosticRuns(this.workspaceId, domain.id, 1)[0];
+    const latest = this.repository.listDiagnosticRuns(this.workspaceId, domain.id, 1)[0];
     if (latest && now.getTime() - new Date(latest.observedAt).getTime() < 30_000) {
+      const saved = {
+        domainId,
+        requestId: latest.id,
+        status: "complete" as const,
+        runId: latest.id,
+      };
       this.repository.putIdempotency(
         this.workspaceId,
         key,
-        "live_diagnostic",
+        "diagnostic",
         requestJson,
-        { domainId, requestId: latest.id, status: "complete", runId: latest.id },
+        saved,
         now.toISOString(),
       );
       return {
@@ -117,25 +144,25 @@ export class DomainService {
         existingRun: latest,
       };
     }
-
     const requestId = crypto.randomUUID();
-    const acquired = this.repository.acquireLiveDiagnostic(
-      this.workspaceId,
-      domain.id,
-      requestId,
-      now.toISOString(),
-      new Date(now.getTime() - 60_000).toISOString(),
-    );
-    if (!acquired) {
+    if (
+      !this.repository.acquireDiagnostic(
+        this.workspaceId,
+        domain.id,
+        requestId,
+        now.toISOString(),
+        new Date(now.getTime() - 60_000).toISOString(),
+      )
+    ) {
       throw DomainError.conflict(
-        "LIVE_DIAGNOSTIC_IN_PROGRESS",
-        "A live diagnostic is already running for this domain.",
+        "DIAGNOSTIC_IN_PROGRESS",
+        "A diagnostic check is already running for this domain.",
       );
     }
     this.repository.putIdempotency(
       this.workspaceId,
       key,
-      "live_diagnostic",
+      "diagnostic",
       requestJson,
       { domainId, requestId, status: "pending", runId: null },
       now.toISOString(),
@@ -143,7 +170,7 @@ export class DomainService {
     return { domain, requestId, duplicate: false, shouldRun: true, existingRun: null };
   }
 
-  completeLiveDiagnostic(
+  completeDiagnostic(
     domainId: string,
     idempotencyKey: string,
     requestId: string,
@@ -158,16 +185,16 @@ export class DomainService {
       hostname: domain.hostname,
       source: "live_public",
     };
-    if (!this.repository.releaseLiveDiagnostic(this.workspaceId, domain.id, requestId)) {
-      const existing = this.repository.getLiveDiagnosticRun(this.workspaceId, domain.id, requestId);
+    if (!this.repository.releaseDiagnostic(this.workspaceId, domain.id, requestId)) {
+      const existing = this.repository.getDiagnosticRun(this.workspaceId, domain.id, requestId);
       if (existing) return existing;
       throw DomainError.conflict(
-        "STALE_LIVE_DIAGNOSTIC",
-        "This live diagnostic request is no longer active.",
+        "STALE_DIAGNOSTIC",
+        "This diagnostic request is no longer active.",
       );
     }
-    this.repository.insertLiveDiagnosticRun(run);
-    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "live_diagnostic", {
+    this.repository.insertDiagnosticRun(run);
+    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "diagnostic", {
       domainId,
       requestId,
       status: "complete",
@@ -176,383 +203,55 @@ export class DomainService {
     return run;
   }
 
-  failLiveDiagnostic(domainId: string, idempotencyKey: string, requestId: string): void {
+  failDiagnostic(domainId: string, idempotencyKey: string, requestId: string): void {
     const domain = this.getDomain(domainId);
-    this.repository.releaseLiveDiagnostic(this.workspaceId, domain.id, requestId);
-    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "live_diagnostic", {
+    this.repository.releaseDiagnostic(this.workspaceId, domain.id, requestId);
+    this.repository.updateIdempotencyResponse(this.workspaceId, idempotencyKey, "diagnostic", {
       domainId,
       requestId,
       status: "failed",
       runId: null,
     });
   }
-
-  assessDns(domainId: string): DnsAssessment {
-    const domain = this.getDomain(domainId);
-    const matchingRecords = domain.expectedDnsRecords.filter((expected) =>
-      domain.observedDnsRecords.some((observed) => recordsEqual(expected, observed)),
-    );
-    const missingRecords = domain.expectedDnsRecords.filter(
-      (expected) => !domain.observedDnsRecords.some((observed) => recordsEqual(expected, observed)),
-    );
-    const unexpectedRecords = domain.observedDnsRecords.filter(
-      (observed) => !domain.expectedDnsRecords.some((expected) => recordsEqual(expected, observed)),
-    );
-
-    return {
-      domainId: domain.id,
-      hostname: domain.hostname,
-      source: "simulation",
-      expectedRecords: domain.expectedDnsRecords,
-      observedRecords: domain.observedDnsRecords,
-      matchingRecords,
-      missingRecords,
-      unexpectedRecords,
-      requiredValidationRecords: domain.requiredValidationRecords,
-      dnsStatus: domain.dnsStatus,
-      hostnameStatus: domain.hostnameStatus,
-      sslStatus: domain.sslStatus,
-      validationState: domain.validationState,
-      ready: domain.ready,
-    };
-  }
-
-  registerDomain(
-    input: RegisterDomainInput | unknown,
-    idempotencyKey: string,
-  ): RegisterDomainResult {
-    const key = validateIdempotencyKey(idempotencyKey);
-    const parsed = parseRegisterDomainInput(input);
-    const requestJson = JSON.stringify(parsed);
-    const stored = this.repository.getIdempotency<StoredRegistration>(
-      this.workspaceId,
-      key,
-      "register_domain",
-      requestJson,
-    );
-    if (stored) {
-      return { domain: this.getDomainOrThrow(stored.domainId), duplicate: true };
-    }
-
-    if (this.repository.getDomainByHostname(this.workspaceId, parsed.hostname)) {
-      throw DomainError.conflict(
-        "DOMAIN_ALREADY_EXISTS",
-        "Hostname is already registered in this workspace.",
-        {
-          hostname: parsed.hostname,
-        },
-      );
-    }
-
-    const now = new Date().toISOString();
-    const state = initialSimulationState(
-      parsed.hostname,
-      parsed.expectedDnsTarget,
-      parsed.simulationProfile,
-      parsed.observedDnsRecord,
-    );
-    const domain: NewDomain = {
-      id: crypto.randomUUID(),
-      workspaceId: this.workspaceId,
-      hostname: parsed.hostname,
-      expectedDnsTarget: parsed.expectedDnsTarget,
-      ...state,
-      source: "simulation",
-      simulationProfile: parsed.simulationProfile,
-      createdAt: now,
-      updatedAt: now,
-      lastValidationAttemptAt: null,
-      retryCount: 0,
-      lastAppliedAttempt: 0,
-      activeValidationId: null,
-    };
-    this.repository.insertDomain(domain);
-    this.repository.insertEvent({
-      workspaceId: this.workspaceId,
-      domainId: domain.id,
-      eventType: "domain_registered",
-      category: "domain",
-      previousValue: null,
-      nextValue: "registered",
-      diagnosticCode: "DOMAIN_REGISTERED",
-      message: "Domain registered with deterministic simulated provider state.",
-      metadata: {
-        simulationProfile: domain.simulationProfile,
-        expectedDnsTarget: domain.expectedDnsTarget,
-      },
-      validationId: null,
-      attempt: null,
-      source: "user",
-      createdAt: now,
-      dedupeKey: `register:${domain.id}`,
-    });
-    this.repository.putIdempotency(
-      this.workspaceId,
-      key,
-      "register_domain",
-      requestJson,
-      { domainId: domain.id },
-      now,
-    );
-    return { domain: this.getDomainOrThrow(domain.id), duplicate: false };
-  }
-
-  beginRevalidation(domainId: string, idempotencyKey: string): BeginRevalidationResult {
-    validateDomainId(domainId);
-    const key = validateIdempotencyKey(idempotencyKey);
-    const requestJson = JSON.stringify({ domainId });
-    const stored = this.repository.getIdempotency<StoredRevalidation>(
-      this.workspaceId,
-      key,
-      "revalidate_domain",
-      requestJson,
-    );
-    if (stored) {
-      return {
-        domain: this.getDomainOrThrow(stored.domainId),
-        workflowId: stored.workflowId,
-        attempt: stored.attempt,
-        duplicate: true,
-        shouldStart: false,
-      };
-    }
-
-    const domain = this.getDomainOrThrow(domainId);
-    if (domain.activeValidationId) {
-      throw DomainError.conflict(
-        "VALIDATION_IN_PROGRESS",
-        "A validation is already running for this domain.",
-        {
-          validationId: domain.activeValidationId,
-        },
-      );
-    }
-
-    const now = new Date().toISOString();
-    const attempt = domain.retryCount + 1;
-    const workflowId = `revalidate_${crypto.randomUUID().replaceAll("-", "")}_${attempt}`;
-    this.repository.startValidation(this.workspaceId, domain.id, workflowId, attempt, now);
-    this.repository.insertEvent({
-      workspaceId: this.workspaceId,
-      domainId: domain.id,
-      eventType: "validation_started",
-      category: "validation",
-      previousValue: domain.validationState,
-      nextValue: "checking",
-      diagnosticCode: "VALIDATION_STARTED",
-      message: "Deterministic simulated revalidation started.",
-      metadata: { profile: domain.simulationProfile },
-      validationId: workflowId,
-      attempt,
-      source: "user",
-      createdAt: now,
-      dedupeKey: `${workflowId}:started`,
-    });
-    this.repository.putIdempotency(
-      this.workspaceId,
-      key,
-      "revalidate_domain",
-      requestJson,
-      { domainId: domain.id, workflowId, attempt },
-      now,
-    );
-
-    return {
-      domain: this.getDomainOrThrow(domain.id),
-      workflowId,
-      attempt,
-      duplicate: false,
-      shouldStart: true,
-    };
-  }
-
-  applyRevalidationResult(
-    domainId: string,
-    validationId: string,
-    attempt: number,
-    outcome: RevalidationOutcome,
-  ): Domain {
-    const before = this.getDomain(domainId);
-    if (before.lastAppliedAttempt >= attempt || before.activeValidationId !== validationId)
-      return before;
-
-    const now = new Date().toISOString();
-    const applied = this.repository.applyOutcome(
-      this.workspaceId,
-      before.id,
-      validationId,
-      attempt,
-      outcome,
-      now,
-    );
-    if (!applied) return this.getDomainOrThrow(before.id);
-
-    this.recordStatusChange(
-      before,
-      "dns",
-      before.dnsStatus,
-      outcome.dnsStatus,
-      outcome,
-      validationId,
-      attempt,
-      now,
-    );
-    this.recordStatusChange(
-      before,
-      "hostname",
-      before.hostnameStatus,
-      outcome.hostnameStatus,
-      outcome,
-      validationId,
-      attempt,
-      now,
-    );
-    this.recordStatusChange(
-      before,
-      "ssl",
-      before.sslStatus,
-      outcome.sslStatus,
-      outcome,
-      validationId,
-      attempt,
-      now,
-    );
-    this.recordStatusChange(
-      before,
-      "validation",
-      "checking",
-      outcome.validationState,
-      outcome,
-      validationId,
-      attempt,
-      now,
-    );
-    this.repository.insertEvent({
-      workspaceId: this.workspaceId,
-      domainId: before.id,
-      eventType:
-        outcome.validationState === "failed" ? "validation_failed" : "validation_completed",
-      category: "workflow",
-      previousValue: "running",
-      nextValue: "complete",
-      diagnosticCode: outcome.diagnosticCode,
-      message: outcome.message,
-      metadata: { simulated: true },
-      validationId,
-      attempt,
-      source: "simulation",
-      createdAt: now,
-      dedupeKey: `${validationId}:completed`,
-    });
-    return this.getDomainOrThrow(before.id);
-  }
-
-  failRevalidationStart(
-    domainId: string,
-    validationId: string,
-    attempt: number,
-    message: string,
-  ): Domain {
-    const domain = this.getDomain(domainId);
-    const now = new Date().toISOString();
-    if (this.repository.failValidationStart(this.workspaceId, domain.id, validationId, now)) {
-      this.repository.insertEvent({
-        workspaceId: this.workspaceId,
-        domainId: domain.id,
-        eventType: "validation_failed",
-        category: "workflow",
-        previousValue: "starting",
-        nextValue: "failed",
-        diagnosticCode: "WORKFLOW_START_FAILED",
-        message,
-        metadata: {},
-        validationId,
-        attempt,
-        source: "system",
-        createdAt: now,
-        dedupeKey: `${validationId}:start-failed`,
-      });
-    }
-    return this.getDomainOrThrow(domain.id);
-  }
-
-  private recordStatusChange(
-    domain: Domain,
-    category: "dns" | "hostname" | "ssl" | "validation",
-    previousValue: string,
-    nextValue: string,
-    outcome: RevalidationOutcome,
-    validationId: string,
-    attempt: number,
-    timestamp: string,
-  ): void {
-    if (previousValue === nextValue) return;
-    this.repository.insertEvent({
-      workspaceId: this.workspaceId,
-      domainId: domain.id,
-      eventType: "status_changed",
-      category,
-      previousValue,
-      nextValue,
-      diagnosticCode: outcome.diagnosticCode,
-      message: outcome.message,
-      metadata: { simulated: true },
-      validationId,
-      attempt,
-      source: "simulation",
-      createdAt: timestamp,
-      dedupeKey: `${validationId}:status:${category}`,
-    });
-  }
-
-  private seedDemoDomains(): void {
-    const target = "customers.domainops.example";
-    for (const [index, seed] of seededDomains.entries()) {
-      if (this.repository.getDomainByHostname(this.workspaceId, seed.hostname)) continue;
-      const now = new Date(Date.now() + index).toISOString();
-      const state = initialSimulationState(seed.hostname, target, seed.profile);
-      const domain: NewDomain = {
-        id: crypto.randomUUID(),
-        workspaceId: this.workspaceId,
-        hostname: seed.hostname,
-        expectedDnsTarget: target,
-        ...state,
-        source: "simulation",
-        simulationProfile: seed.profile,
-        createdAt: now,
-        updatedAt: now,
-        lastValidationAttemptAt: null,
-        retryCount: 0,
-        lastAppliedAttempt: 0,
-        activeValidationId: null,
-      };
-      this.repository.insertDomain(domain);
-      this.repository.insertEvent({
-        workspaceId: this.workspaceId,
-        domainId: domain.id,
-        eventType: "domain_registered",
-        category: "domain",
-        previousValue: null,
-        nextValue: "seeded",
-        diagnosticCode: "DEMO_DOMAIN_SEEDED",
-        message: `Seeded ${seed.profile.replaceAll("_", " ")} simulated domain.`,
-        metadata: { simulationProfile: seed.profile },
-        validationId: null,
-        attempt: null,
-        source: "system",
-        createdAt: now,
-        dedupeKey: `seed:${this.workspaceId}:${seed.hostname}`,
-      });
-    }
-  }
-
-  private getDomainOrThrow(domainId: string): Domain {
-    const domain = this.repository.getDomain(this.workspaceId, domainId);
-    if (!domain) throw DomainError.notFound();
-    return domain;
-  }
 }
 
-function recordsEqual(left: DnsRecord, right: DnsRecord): boolean {
-  return left.type === right.type && left.name === right.name && left.value === right.value;
+export function compareRuns(
+  previous: LiveDiagnosticRun | undefined,
+  current: LiveDiagnosticRun,
+): DiagnosticChange[] {
+  if (!previous) return [];
+  const changes: DiagnosticChange[] = [];
+  if (previous.status !== current.status)
+    changes.push({
+      area: "overall",
+      previous: previous.status,
+      current: current.status,
+      message: `Overall health changed from ${previous.status} to ${current.status}.`,
+    });
+  for (const type of ["A", "AAAA", "CNAME", "TXT", "CAA"] as const) {
+    const before = previous.dns.find((query) => query.type === type)?.status ?? "unavailable";
+    const after = current.dns.find((query) => query.type === type)?.status ?? "unavailable";
+    if (before !== after)
+      changes.push({
+        area: "dns",
+        previous: `${type}: ${before}`,
+        current: `${type}: ${after}`,
+        message: `${type} lookup changed from ${before} to ${after}.`,
+      });
+  }
+  if (previous.https.status !== current.https.status)
+    changes.push({
+      area: "https",
+      previous: previous.https.status,
+      current: current.https.status,
+      message: `HTTPS reachability changed from ${previous.https.status} to ${current.https.status}.`,
+    });
+  if (previous.tls.handshake !== current.tls.handshake)
+    changes.push({
+      area: "tls",
+      previous: previous.tls.handshake,
+      current: current.tls.handshake,
+      message: `TLS handshake changed from ${previous.tls.handshake} to ${current.tls.handshake}.`,
+    });
+  return changes;
 }

@@ -1,93 +1,96 @@
 import { describe, expect, it } from "vitest";
-import {
-  evaluateRevalidation,
-  initialSimulationState,
-  isDomainReady,
-} from "../src/domain/simulation";
+import { compareRuns } from "../src/domain/service";
 import {
   normalizeHostname,
   parseRegisterDomainInput,
-  validateWorkspaceId,
+  validateWorkspaceName,
 } from "../src/domain/validation";
+import type { LiveDiagnosticRun } from "../src/domain/types";
 
-describe("input validation", () => {
-  it("normalizes hostnames and defaults registration fields", () => {
-    expect(normalizeHostname(" App.Customer.COM. ")).toBe("app.customer.com");
-    expect(parseRegisterDomainInput({ hostname: "App.Customer.COM." })).toEqual({
-      hostname: "app.customer.com",
-      expectedDnsTarget: "customers.domainops.example",
-      observedDnsRecord: undefined,
-      simulationProfile: "pending_ssl",
+describe("domain inputs", () => {
+  it("normalizes public hostnames and accepts only the live registration shape", () => {
+    expect(parseRegisterDomainInput({ hostname: "WWW.Cloudflare.COM." })).toEqual({
+      hostname: "www.cloudflare.com",
     });
+    expect(() => normalizeHostname("https://cloudflare.com")).toThrow();
   });
+  it("validates workspace display names", () => {
+    expect(validateWorkspaceName("  Platform   team ")).toBe("Platform team");
+    expect(() => validateWorkspaceName(" ")).toThrow(/1-80/);
+  });
+});
 
-  it.each(["", "localhost", "https://app.example.com", "app.example.com/path", "-bad.example.com"])(
-    "rejects invalid hostname %s",
-    (value) => expect(() => normalizeHostname(value)).toThrow(/valid fully-qualified hostname/),
-  );
+describe("diagnostic changes", () => {
+  it("highlights meaningful health, DNS, HTTPS, and TLS changes", () => {
+    const previous = run({
+      status: "failed",
+      dnsStatus: "no_records",
+      https: "unreachable",
+      tls: "failed",
+    });
+    const current = run({
+      status: "healthy",
+      dnsStatus: "success",
+      https: "reachable",
+      tls: "succeeded",
+    });
+    expect(compareRuns(previous, current)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ area: "overall", current: "healthy" }),
+        expect.objectContaining({ area: "dns", current: "A: success" }),
+        expect.objectContaining({ area: "https", current: "reachable" }),
+        expect.objectContaining({ area: "tls", current: "succeeded" }),
+      ]),
+    );
+  });
+  it("does not invent changes for a first observation", () =>
+    expect(compareRuns(undefined, run({}))).toEqual([]));
+});
 
-  it.each(["Uppercase", "spaces are bad", "too/clever"])(
-    "rejects invalid workspace %s",
-    (value) => {
-      expect(() => validateWorkspaceId(value)).toThrow(/workspaceId/);
+function run(options: {
+  status?: LiveDiagnosticRun["status"];
+  dnsStatus?: "success" | "no_records";
+  https?: "reachable" | "unreachable";
+  tls?: "succeeded" | "failed";
+}): LiveDiagnosticRun {
+  return {
+    id: crypto.randomUUID(),
+    workspaceId: "ws-test",
+    domainId: crypto.randomUUID(),
+    hostname: "www.cloudflare.com",
+    source: "live_public",
+    status: options.status ?? "healthy",
+    observedAt: "2026-10-25T12:00:00.000Z",
+    completedAt: "2026-10-25T12:00:01.000Z",
+    durationMs: 1000,
+    dnsProvider: "Cloudflare DNS over HTTPS",
+    dns: [
+      {
+        type: "A",
+        status: options.dnsStatus ?? "success",
+        responseCode: 0,
+        responseCodeName: "NOERROR",
+        records: [],
+        error: null,
+      },
+    ],
+    publicAddresses: ["104.16.1.2"],
+    safety: { allowed: true, blockedAddresses: [], reason: null },
+    https: {
+      status: options.https ?? "reachable",
+      url: "https://www.cloudflare.com/",
+      statusCode: 200,
+      responseTimeMs: 30,
+      redirectLocation: null,
+      headers: {},
+      error: null,
     },
-  );
-});
-
-describe("deterministic simulated state", () => {
-  it("keeps hostname and SSL statuses independent", () => {
-    const state = initialSimulationState(
-      "pending-ssl.demo.example",
-      "customers.domainops.example",
-      "pending_ssl",
-    );
-    expect(state.hostnameStatus).toBe("active");
-    expect(state.sslStatus).toBe("pending_issuance");
-    expect(
-      isDomainReady(state.dnsStatus, state.hostnameStatus, state.sslStatus, state.validationState),
-    ).toBe(false);
-  });
-
-  it("lets an explicit observed record override reveal a DNS mismatch", () => {
-    const state = initialSimulationState(
-      "active.customer.example",
-      "customers.domainops.example",
-      "active",
-      "wrong-origin.customer.example",
-    );
-    expect(state).toMatchObject({
-      dnsStatus: "invalid",
-      hostnameStatus: "pending",
-      sslStatus: "pending_validation",
-      validationState: "dns_misconfigured",
-    });
-  });
-
-  it("requires every readiness condition", () => {
-    expect(isDomainReady("valid", "active", "active", "active")).toBe(true);
-    expect(isDomainReady("valid", "active", "pending_deployment", "active")).toBe(false);
-    expect(isDomainReady("valid", "pending", "active", "active")).toBe(false);
-    expect(isDomainReady("invalid", "active", "active", "active")).toBe(false);
-  });
-
-  it("returns the same profile outcome for the same attempt", () => {
-    const first = evaluateRevalidation("incorrect-dns.demo.example", "incorrect_dns", 2);
-    const second = evaluateRevalidation("incorrect-dns.demo.example", "incorrect_dns", 2);
-    expect(second).toEqual(first);
-    expect(first).toMatchObject({
-      dnsStatus: "invalid",
-      hostnameStatus: "pending",
-      sslStatus: "pending_validation",
-      validationState: "dns_misconfigured",
-    });
-  });
-
-  it("deterministically completes the pending SSL demo on its first retry", () => {
-    expect(evaluateRevalidation("pending-ssl.demo.example", "pending_ssl", 1)).toMatchObject({
-      dnsStatus: "valid",
-      hostnameStatus: "active",
-      sslStatus: "active",
-      validationState: "active",
-    });
-  });
-});
+    tls: {
+      handshake: options.tls ?? "succeeded",
+      certificateMetadataAvailable: false,
+      limitation: "Certificate metadata unavailable.",
+    },
+    findings: [],
+    limitations: [],
+  };
+}

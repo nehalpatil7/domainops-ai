@@ -1,264 +1,169 @@
 import { env } from "cloudflare:workers";
-import { introspectWorkflow } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { DiagnosticEvent, Domain, LiveDiagnosticRun } from "../src/domain/types";
+import type { Domain, LiveDiagnosticRun, Workspace } from "../src/domain/types";
 import worker from "../src/server";
 
-type Envelope<T> = { data: T; meta: { workspaceId: string; simulated: boolean } };
+type Envelope<T> = { data: T; meta: { source: "live_public"; workspaceId?: string } };
 
 describe("Worker entry point", () => {
-  it("reports simulation mode from the health route", async () => {
+  it("reports only live public mode", async () => {
     const response = await worker.fetch(new Request("https://domainops.test/api/health"), env);
-    expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
       service: "domainops-ai",
       status: "ok",
-      modes: {
-        onboarding: "simulation",
-        diagnostics: "live_public",
-      },
+      mode: "live_public",
     });
   });
-
-  it("returns a consistent not-found error", async () => {
-    const response = await worker.fetch(new Request("https://domainops.test/api/nope"), env);
-    expect(response.status).toBe(404);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "ROUTE_NOT_FOUND" } });
-  });
-
-  it("routes the workspace chat agent and initializes persistent message storage", async () => {
-    const workspace = uniqueWorkspace("chat");
+  it("routes isolated persistent chat sessions", async () => {
     const response = await worker.fetch(
-      new Request(`https://domainops.test/agents/domain-ops-chat-agent/${workspace}/get-messages`),
+      new Request(
+        `https://domainops.test/agents/domain-ops-chat-agent/${workspaceId("chat")}/get-messages`,
+      ),
       env,
     );
     expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("application/json");
     await expect(response.json()).resolves.toEqual([]);
   });
 });
 
-describe("workspace domain API", () => {
-  it("seeds four realistic, independently modeled demo states", async () => {
-    const workspace = uniqueWorkspace("seed");
-    const response = await request(workspace, "");
-    expect(response.status).toBe(200);
-    const payload = (await response.json()) as Envelope<Domain[]>;
-
-    expect(payload.meta).toMatchObject({ workspaceId: workspace, simulated: true });
-    expect(payload.data).toHaveLength(4);
-    expect(payload.data.map((domain) => domain.simulationProfile)).toEqual([
-      "active",
-      "incorrect_dns",
-      "pending_ssl",
-      "validation_failure",
-    ]);
-    expect(payload.data.find((domain) => domain.simulationProfile === "active")?.ready).toBe(true);
-    expect(payload.data.find((domain) => domain.simulationProfile === "pending_ssl")).toMatchObject(
-      {
-        hostnameStatus: "active",
-        sslStatus: "pending_issuance",
-        ready: false,
-      },
-    );
-  });
-
-  it("registers idempotently and records one registration event", async () => {
-    const workspace = uniqueWorkspace("register");
-    const key = "register:stable-request";
-    const init = {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
-      body: JSON.stringify({
-        hostname: "App.Customer.Example.",
-        simulationProfile: "incorrect_dns",
-      }),
-    };
-    const first = await request(workspace, "", init);
-    const second = await request(workspace, "", init);
-    expect(first.status).toBe(201);
-    expect(second.status).toBe(200);
-
-    const created = ((await first.json()) as Envelope<{ domain: Domain; duplicate: boolean }>).data;
-    const repeated = ((await second.json()) as Envelope<{ domain: Domain; duplicate: boolean }>)
-      .data;
-    expect(created).toMatchObject({
-      duplicate: false,
-      domain: { hostname: "app.customer.example" },
-    });
-    expect(repeated).toMatchObject({ duplicate: true, domain: { id: created.domain.id } });
-
-    const history = await request(workspace, `/${created.domain.id}/history`);
-    const events = ((await history.json()) as Envelope<DiagnosticEvent[]>).data;
-    expect(events.filter((event) => event.eventType === "domain_registered")).toHaveLength(1);
-  });
-
-  it("isolates domain data between workspaces", async () => {
-    const firstWorkspace = uniqueWorkspace("tenant-a");
-    const secondWorkspace = uniqueWorkspace("tenant-b");
-    const registration = await request(firstWorkspace, "", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:isolation-test" },
-      body: JSON.stringify({ hostname: "isolated.customer.example", simulationProfile: "active" }),
-    });
-    const domain = ((await registration.json()) as Envelope<{ domain: Domain }>).data.domain;
-
-    const crossWorkspaceRead = await request(secondWorkspace, `/${domain.id}`);
-    expect(crossWorkspaceRead.status).toBe(404);
-    await expect(crossWorkspaceRead.json()).resolves.toMatchObject({
-      error: { code: "DOMAIN_NOT_FOUND" },
-    });
-  });
-
-  it("validates input and idempotency headers consistently", async () => {
-    const workspace = uniqueWorkspace("invalid");
-    const response = await request(workspace, "", {
+describe("workspace management", () => {
+  it("creates, lists, and renames a stable workspace", async () => {
+    const createdResponse = await fetchApi("/api/workspaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hostname: "not a hostname" }),
+      body: JSON.stringify({ name: "Platform team" }),
     });
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: "INVALID_REQUEST" },
-      requestId: expect.any(String),
+    expect(createdResponse.status).toBe(201);
+    const created = ((await createdResponse.json()) as Envelope<Workspace>).data;
+    const renamedResponse = await fetchApi(`/api/workspaces/${created.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Edge platform" }),
     });
-  });
-
-  it("runs deterministic revalidation and deduplicates repeated requests", async () => {
-    const workspace = uniqueWorkspace("workflow");
-    const list = await request(workspace, "");
-    const domains = ((await list.json()) as Envelope<Domain[]>).data;
-    const pending = domains.find((domain) => domain.simulationProfile === "pending_ssl");
-    expect(pending).toBeDefined();
-
-    const workflow = await introspectWorkflow(env.DOMAIN_REVALIDATION_WORKFLOW);
-    try {
-      await workflow.modifyAll(async (modifier) => modifier.disableSleeps());
-      const key = "revalidate:stable-request";
-      const first = await request(workspace, `/${pending!.id}/revalidate`, {
-        method: "POST",
-        headers: { "Idempotency-Key": key },
-      });
-      const second = await request(workspace, `/${pending!.id}/revalidate`, {
-        method: "POST",
-        headers: { "Idempotency-Key": key },
-      });
-      expect(first.status).toBe(202);
-      expect(second.status).toBe(200);
-      const firstResult = ((await first.json()) as Envelope<{ workflowId: string }>).data;
-      const secondResult = (
-        (await second.json()) as Envelope<{ workflowId: string; duplicate: boolean }>
-      ).data;
-      expect(secondResult).toMatchObject({ workflowId: firstResult.workflowId, duplicate: true });
-
-      const instances = await workflow.get();
-      expect(instances).toHaveLength(1);
-      await instances[0].waitForStatus("complete");
-
-      const details = await request(workspace, `/${pending!.id}`);
-      const domain = ((await details.json()) as Envelope<Domain>).data;
-      expect(domain).toMatchObject({
-        dnsStatus: "valid",
-        hostnameStatus: "active",
-        sslStatus: "active",
-        validationState: "active",
-        retryCount: 1,
-        ready: true,
-      });
-
-      const history = await request(workspace, `/${pending!.id}/history`);
-      const events = ((await history.json()) as Envelope<DiagnosticEvent[]>).data;
-      expect(events.filter((event) => event.eventType === "validation_started")).toHaveLength(1);
-      expect(events.filter((event) => event.eventType === "validation_completed")).toHaveLength(1);
-    } finally {
-      await workflow.dispose();
-    }
-  });
-
-  it("persists live observations separately and deduplicates diagnostic requests", async () => {
-    const workspace = uniqueWorkspace("live");
-    const registration = await request(workspace, "", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:live-mode" },
-      body: JSON.stringify({ hostname: "www.public-domain.com", simulationProfile: "active" }),
+    expect(((await renamedResponse.json()) as Envelope<Workspace>).data).toMatchObject({
+      id: created.id,
+      name: "Edge platform",
     });
-    const domain = ((await registration.json()) as Envelope<{ domain: Domain }>).data.domain;
-    const store = env.WorkspaceDomainStore.get(env.WorkspaceDomainStore.idFromName(workspace));
-    const prepared = await store.prepareLiveDiagnostic(workspace, domain.id, "live:stable-request");
-    expect(prepared).toMatchObject({ ok: true, value: { shouldRun: true, duplicate: false } });
-    if (!prepared.ok) throw new Error(prepared.error.message);
-
-    const completed = await store.completeLiveDiagnostic(
-      workspace,
-      domain.id,
-      "live:stable-request",
-      prepared.value.requestId,
-      liveRun(domain, prepared.value.requestId),
-    );
-    expect(completed).toMatchObject({
-      ok: true,
-      value: { source: "live_public", hostname: domain.hostname, status: "healthy" },
-    });
-
-    const replay = await store.prepareLiveDiagnostic(workspace, domain.id, "live:stable-request");
-    expect(replay).toMatchObject({
-      ok: true,
-      value: { shouldRun: false, duplicate: true, existingRun: { source: "live_public" } },
-    });
-
-    const rateLimited = await store.prepareLiveDiagnostic(
-      workspace,
-      domain.id,
-      "live:new-request-key",
-    );
-    expect(rateLimited).toMatchObject({
-      ok: true,
-      value: { shouldRun: false, duplicate: false, existingRun: { id: prepared.value.requestId } },
-    });
-
-    const history = await request(workspace, `/${domain.id}/live-diagnostics`);
-    expect(history.status).toBe(200);
-    const payload = (await history.json()) as Envelope<LiveDiagnosticRun[]> & {
-      meta: { source: string; simulated: boolean; workspaceId: string };
-    };
-    expect(payload.meta).toMatchObject({ source: "live_public", simulated: false });
-    expect(payload.data).toHaveLength(1);
-    expect(JSON.stringify(payload.data)).not.toContain("requiredValidationRecords");
+    const list = ((await (await fetchApi("/api/workspaces")).json()) as Envelope<Workspace[]>).data;
+    expect(list).toContainEqual(expect.objectContaining({ id: created.id, name: "Edge platform" }));
   });
 });
 
-function uniqueWorkspace(prefix: string): string {
+describe("live domain registry", () => {
+  it("starts empty and registers a normalized public hostname idempotently", async () => {
+    const workspace = workspaceId("register");
+    const empty = ((await (await domainRequest(workspace, "")).json()) as Envelope<Domain[]>).data;
+    expect(empty).toEqual([]);
+    const init = {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:stable-key" },
+      body: JSON.stringify({ hostname: "WWW.Cloudflare.COM." }),
+    };
+    const first = await domainRequest(workspace, "", init);
+    const second = await domainRequest(workspace, "", init);
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    const created = ((await first.json()) as Envelope<{ domain: Domain; duplicate: boolean }>).data;
+    expect(created).toMatchObject({
+      duplicate: false,
+      domain: { hostname: "www.cloudflare.com", healthStatus: "unknown", latestDiagnostic: null },
+    });
+    expect(((await second.json()) as Envelope<{ duplicate: boolean }>).data.duplicate).toBe(true);
+  });
+  it("keeps domains isolated by workspace", async () => {
+    const first = workspaceId("one"),
+      second = workspaceId("two");
+    const registered = await domainRequest(first, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:isolation" },
+      body: JSON.stringify({ hostname: "status.cloudflare.com" }),
+    });
+    const domain = ((await registered.json()) as Envelope<{ domain: Domain }>).data.domain;
+    const cross = await domainRequest(second, `/${domain.id}`);
+    expect(cross.status).toBe(404);
+    await expect(cross.json()).resolves.toMatchObject({ error: { code: "DOMAIN_NOT_FOUND" } });
+  });
+  it("rejects reserved and non-public hostnames", async () => {
+    const workspace = workspaceId("safe");
+    const blocked = await domainRequest(workspace, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:blocked" },
+      body: JSON.stringify({ hostname: "internal.example" }),
+    });
+    expect(blocked.status).toBe(400);
+  });
+
+  it("persists real checks idempotently and derives health from the latest snapshot", async () => {
+    const workspace = workspaceId("history");
+    const registered = await domainRequest(workspace, "", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "register:history" },
+      body: JSON.stringify({ hostname: "developers.cloudflare.com" }),
+    });
+    const domain = ((await registered.json()) as Envelope<{ domain: Domain }>).data.domain;
+    const store = env.WorkspaceDomainStore.get(env.WorkspaceDomainStore.idFromName(workspace));
+    const preparation = await store.prepareDiagnostic(workspace, domain.id, "diagnostic:history");
+    expect(preparation).toMatchObject({ ok: true, value: { shouldRun: true } });
+    if (!preparation.ok) throw new Error("Preparation failed");
+    const completed = await store.completeDiagnostic(
+      workspace,
+      domain.id,
+      "diagnostic:history",
+      preparation.value.requestId,
+      diagnosticRun("developers.cloudflare.com"),
+    );
+    expect(completed).toMatchObject({ ok: true, value: { status: "healthy" } });
+    const replay = await store.prepareDiagnostic(workspace, domain.id, "diagnostic:history");
+    expect(replay).toMatchObject({ ok: true, value: { duplicate: true, shouldRun: false } });
+    const current = await store.getDomain(workspace, domain.id);
+    expect(current).toMatchObject({
+      ok: true,
+      value: { healthStatus: "healthy", lastCheckedAt: "2026-10-25T12:00:00.000Z" },
+    });
+    const history = await store.getDiagnosticHistory(workspace, domain.id);
+    expect(history).toMatchObject({ ok: true, value: [{ source: "live_public", changes: [] }] });
+  });
+});
+
+function fetchApi(path: string, init?: RequestInit) {
+  return worker.fetch(new Request(`https://domainops.test${path}`, init), env);
+}
+function domainRequest(workspace: string, suffix: string, init?: RequestInit) {
+  return fetchApi(`/api/workspaces/${workspace}/domains${suffix}`, init);
+}
+function workspaceId(prefix: string) {
   return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
-function request(workspace: string, path: string, init?: RequestInit): Promise<Response> {
-  return worker.fetch(
-    new Request(`https://domainops.test/api/workspaces/${workspace}/domains${path}`, init),
-    env,
-  );
-}
-
-function liveRun(domain: Domain, id: string): LiveDiagnosticRun {
-  const now = new Date().toISOString();
+function diagnosticRun(hostname: string): LiveDiagnosticRun {
   return {
-    id,
-    workspaceId: "",
-    domainId: "",
-    hostname: domain.hostname,
+    id: "replaced-by-service",
+    workspaceId: "replaced-by-service",
+    domainId: "replaced-by-service",
+    hostname,
     source: "live_public",
     status: "healthy",
-    observedAt: now,
-    completedAt: now,
+    observedAt: "2026-10-25T12:00:00.000Z",
+    completedAt: "2026-10-25T12:00:01.000Z",
     durationMs: 1000,
     dnsProvider: "Cloudflare DNS over HTTPS",
-    dns: [],
+    dns: [
+      {
+        type: "A",
+        status: "success",
+        responseCode: 0,
+        responseCodeName: "NOERROR",
+        records: [{ type: "A", name: hostname, value: "104.16.1.2", ttl: 300 }],
+        error: null,
+      },
+    ],
     publicAddresses: ["104.16.1.2"],
     safety: { allowed: true, blockedAddresses: [], reason: null },
     https: {
       status: "reachable",
-      url: `https://${domain.hostname}/`,
+      url: `https://${hostname}/`,
       statusCode: 200,
-      responseTimeMs: 100,
+      responseTimeMs: 30,
       redirectLocation: null,
       headers: {},
       error: null,
@@ -266,9 +171,9 @@ function liveRun(domain: Domain, id: string): LiveDiagnosticRun {
     tls: {
       handshake: "succeeded",
       certificateMetadataAvailable: false,
-      limitation: "Certificate metadata unavailable in Workers fetch.",
+      limitation: "Certificate metadata unavailable.",
     },
-    findings: ["HTTPS reachable."],
-    limitations: ["Point-in-time observation."],
+    findings: ["HTTPS is reachable."],
+    limitations: [],
   };
 }

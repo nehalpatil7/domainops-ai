@@ -1,39 +1,20 @@
 # DomainOps AI
 
-DomainOps AI is a Cloudflare-native reference application for custom-domain onboarding and AI-assisted troubleshooting.
+DomainOps AI is a Cloudflare-native application for monitoring and troubleshooting public domains. It records real public DNS and HTTPS observations, keeps workspace-isolated history, and gives a stateful Workers AI copilot grounded in those results.
 
-The application uses real Cloudflare Workers, SQLite-backed Durable Objects, Workflows, the Agents SDK, and Workers AI. Cloudflare for SaaS onboarding state is deterministically simulated, while the separate live mode observes public DNS and HTTPS. Every result is labeled by source in the API, tools, and dashboard. It is an independent implementation based on public Cloudflare documentation and is not connected to HubSpot systems, data, or source code.
-
-## Included now
-
-- Workspace-isolated domain registration and inventory
-- Expected and observed DNS records
-- Independent hostname activation and SSL certificate statuses
-- Required hostname ownership and certificate validation records
-- Deterministic revalidation through Cloudflare Workflows
-- SQLite-backed status, retry, timestamp, and diagnostic event history
-- Idempotent registration and revalidation mutations
-- Four seeded examples per demo workspace: active, incorrect DNS, pending SSL, and validation failure
-- React dashboard for registration, inspection, and retries
-- Persistent, streaming `AIChatAgent` conversations scoped to each workspace
-- Read-only backend tools for inventory, status, DNS/SSL details, history, and deterministic diagnosis
-- Workers AI inference with `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
-- Live public `A`, `AAAA`, `CNAME`, `TXT`, and `CAA` observations through Cloudflare DNS over HTTPS
-- Safety-limited HTTPS reachability and TLS-handshake observations with timestamped history
+It does **not** report Cloudflare for SaaS custom-hostname activation or internal certificate-provisioning status. Public HTTPS reachability is a separate signal.
 
 ## Stack
 
-- TypeScript and React 19
-- Cloudflare Workers and Static Assets
-- SQLite-backed Durable Objects
-- Cloudflare Workflows
-- Cloudflare Agents SDK, `AIChatAgent`, and `useAgentChat`
-- Workers AI and Llama 3.3 70B Instruct FP8 Fast
-- Vite, Wrangler, and Cloudflare's Vitest integration
+- TypeScript, React 19, Vite, and Cloudflare Workers
+- SQLite-backed Durable Objects for workspace registries, domain data, diagnostic history, and chat memory
+- Cloudflare Agents SDK with `AIChatAgent` and `useAgentChat`
+- Workers AI using `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+- Cloudflare DNS over HTTPS plus safety-limited HTTPS probes
 
-## Get started
+## Local development
 
-Prerequisites are Node.js 22 or newer and npm.
+Requires Node.js 22+, npm, and Wrangler authentication for remote Workers AI inference.
 
 ```bash
 npm install
@@ -42,137 +23,71 @@ npx wrangler login
 npm run dev
 ```
 
-Open `http://localhost:5173`. The Durable Objects and Workflow run in the local Cloudflare runtime. Domain management needs no production Cloudflare for SaaS configuration. Chat inference uses the remote Workers AI binding because there is no local model emulator, so Wrangler authentication is required to start the complete application.
-
-Run the full quality gate:
-
-```bash
-npm run check
-```
-
-Deploy after authenticating Wrangler:
-
-```bash
-npm run deploy
-```
+Run the quality gate with `npm run check`; deploy with `npm run deploy`.
 
 ## API
 
-Responses identify their evidence source through `meta.source`; `meta.simulated` is `true` for onboarding endpoints and `false` for live diagnostics. Replace `:workspaceId` with a lowercase demo workspace ID and `:domainId` with a returned UUID.
+All successful responses include `meta.source: "live_public"`. Mutations that register a domain or run a check require an `Idempotency-Key` header containing 8–128 URL-safe characters.
 
-| Method | Route                                                             | Purpose                                                            |
-| ------ | ----------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `GET`  | `/api/workspaces/:workspaceId/domains`                            | List domains                                                       |
-| `POST` | `/api/workspaces/:workspaceId/domains`                            | Register a domain                                                  |
-| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId`                  | Get current domain state                                           |
-| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId/dns`              | Compare expected and observed DNS and show validation requirements |
-| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId/history`          | List diagnostic and status events                                  |
-| `POST` | `/api/workspaces/:workspaceId/domains/:domainId/revalidate`       | Start a durable revalidation                                       |
-| `GET`  | `/api/workspaces/:workspaceId/domains/:domainId/live-diagnostics` | List saved live public observations                                |
-| `POST` | `/api/workspaces/:workspaceId/domains/:domainId/live-diagnostics` | Run and persist public DNS/HTTPS diagnostics                       |
+| Method  | Route                                                        | Purpose                            |
+| ------- | ------------------------------------------------------------ | ---------------------------------- |
+| `GET`   | `/api/workspaces`                                            | List workspaces                    |
+| `POST`  | `/api/workspaces`                                            | Create a workspace                 |
+| `PATCH` | `/api/workspaces/:workspaceId`                               | Rename a workspace                 |
+| `GET`   | `/api/workspaces/:workspaceId/domains`                       | List registered domains and health |
+| `POST`  | `/api/workspaces/:workspaceId/domains`                       | Register a public hostname         |
+| `GET`   | `/api/workspaces/:workspaceId/domains/:domainId`             | Get the latest domain health       |
+| `GET`   | `/api/workspaces/:workspaceId/domains/:domainId/diagnostics` | Get saved checks and changes       |
+| `POST`  | `/api/workspaces/:workspaceId/domains/:domainId/diagnostics` | Run and persist a public check     |
 
-Mutation requests require an `Idempotency-Key` header with 8–128 URL-safe characters. Registration also requires `Content-Type: application/json`:
+Registration accepts only a hostname:
 
 ```json
-{
-  "hostname": "app.customer.example",
-  "expectedDnsTarget": "customers.domainops.example",
-  "observedDnsRecord": "customers.domainops.example",
-  "simulationProfile": "pending_ssl"
-}
+{ "hostname": "www.example.com" }
 ```
 
-Supported profiles are `active`, `incorrect_dns`, `pending_ssl`, and `validation_failure`. Omitting a profile defaults to `pending_ssl`. Replaying an identical mutation with the same idempotency key returns its existing result without creating another transition or event. Reusing the key for different input returns `409 IDEMPOTENCY_KEY_REUSED`.
+Health is derived from the latest immutable diagnostic snapshot:
 
-## Readiness and status semantics
+- **Healthy** — all completed public checks are healthy.
+- **Needs attention** — the latest snapshot is degraded or failed.
+- **Checking** — a check currently holds the domain’s short-lived run lock.
+- **Unknown** — no completed check exists.
 
-Hostname and SSL status are stored independently. A domain is ready only when:
+## Diagnostics and safety
 
-- DNS status is `valid`;
-- hostname status is `active`;
-- SSL status is `active`; and
-- validation state is `active`.
+Each check queries `A`, `AAAA`, `CNAME`, `TXT`, and `CAA` concurrently through Cloudflare DNS over HTTPS. DNS requests time out after three seconds. If every observed address is public, the Worker makes one HTTPS `HEAD` request on port 443 with redirects disabled and a five-second timeout.
 
-SSL values mirror useful Cloudflare for SaaS concepts such as `pending_validation`, `pending_issuance`, `pending_deployment`, `active`, and timeout/failure states. They are simulated here and do not represent a live Cloudflare zone.
+The service rejects reserved/internal hostnames and blocks HTTPS probes when DNS returns private, loopback, link-local, carrier-grade NAT, documentation, multicast, reserved, or unique-local addresses. It permits one active run per domain, caches a completed result for 30 seconds, requires idempotency keys, and retains the newest 50 snapshots.
 
-## AI assistant
+Workers `fetch()` does not expose peer certificate issuer, SAN, serial, or expiry metadata. DomainOps records only whether HTTPS was reachable and whether the TLS handshake succeeded; unavailable certificate metadata is always labeled as such. DNS preflight cannot pin the later request to the observed IP, so Cloudflare runtime outbound restrictions remain an additional SSRF boundary.
 
-Each workspace connects to its own `DomainOpsChatAgent` Durable Object. `AIChatAgent` stores the multi-turn transcript in SQLite and `useAgentChat` provides WebSocket streaming, reconnection, and history loading.
+## AI copilot
 
-The model has eight server-side tools:
+Each workspace uses a separately named `DomainOpsChatAgent`, so conversation memory does not cross workspaces. The model can list domains, inspect current DNS/HTTPS evidence, review history and changes, and diagnose observed problems. It may run a new public diagnostic only when the user explicitly requests a check or refresh.
 
-- `listDomains`
-- `getDomainStatus`
-- `getDnsConfiguration`
-- `getValidationHistory`
-- `diagnoseDomain`
-- `getLiveDiagnostics`
-- `getLiveDiagnosticHistory`
-- `diagnoseLiveDomain`
+Every domain-specific response starts with a backend tool. Tool results include observation timestamps and freshness. The prompt requires concise answers separated into observed facts, possible causes, and next steps, and the final model step is text-only so a reply cannot end on an unfinished tool call.
 
-The first model step of every turn must call a tool. Tool inputs never accept a workspace ID; the server derives the workspace from the Agent instance name and calls the existing `WorkspaceDomainStore`. Ambiguous matches return candidates and instruct the assistant to ask for clarification. Not-found and backend-error results explicitly prohibit inferred state. `diagnoseDomain` separates confirmed blockers from possible causes and recommended actions.
+## Migration from the earlier demo
 
-All tools are read-only. Registration, revalidation, and running a new live probe remain dashboard/API operations and are not available to the model.
+On first access, each existing workspace Durable Object creates the new live-only tables and copies existing non-demo domain identities and public diagnostic snapshots. The four former seeded `.demo.example` rows are not copied. Legacy simulation tables are no longer read or written, while real hostname IDs and their live history remain available.
 
-### Evidence modes
-
-The dashboard and assistant keep two evidence sources strictly separate:
-
-- `simulation` represents the Cloudflare for SaaS onboarding demo: expected customer DNS, custom-hostname activation, SSL provisioning, validation records, and Workflow history.
-- `live_public` represents timestamped public observations: DNS over HTTPS answers, public-address safety checks, HTTPS reachability, response status/latency, redirects, and whether a TLS handshake succeeded.
-
-Live tools never return simulated validation records or internal provisioning statuses. Running a live check is a dashboard/API action; the assistant remains read-only and can inspect the latest saved observation and its history.
-
-Live diagnostic mutations require an idempotency key. Results are cached for 30 seconds, only one run per domain may be active, the newest 50 snapshots are retained per domain, DNS requests time out after three seconds, and HTTPS requests time out after five seconds.
-
-### Network safety
-
-Live diagnostics accept only normalized ASCII public hostnames. Reserved/internal suffixes and non-public DNS answers—including private, loopback, link-local, carrier-grade NAT, documentation, multicast, and unique-local addresses—block the HTTPS probe. The probe always uses HTTPS on port 443, sends `HEAD`, and does not follow redirects.
-
-Workers `fetch()` does not expose peer certificate chain metadata. A successful request confirms HTTPS reachability and a successful TLS handshake, but issuer, serial number, SANs, and expiry are explicitly reported as unavailable.
-
-The DNS preflight prevents probes when Cloudflare DNS over HTTPS observes a non-public address. Workers does not expose an API to pin the subsequent TLS request to that exact resolved IP, so the Cloudflare runtime's own outbound-network restrictions remain an additional SSRF boundary against DNS rebinding.
-
-## Project structure
-
-```text
-src/
-  agent/            AIChatAgent and read-only backend tools
-  api/              HTTP routing and response envelopes
-  domain/           Validation, simulator, repository, and domain service
-  durable-object/   WorkspaceDomainStore RPC boundary
-  live/             DNS over HTTPS, HTTPS probe, and network-safety rules
-  workflows/        Durable revalidation orchestration
-  app.tsx           React domain dashboard
-  chat-panel.tsx    Persistent streaming chat UI
-  server.ts         Worker entry point
-docs/
-  architecture.md
-test/
-```
-
-See [docs/architecture.md](docs/architecture.md) for persistence, request flow, and implementation constraints.
+The global workspace catalog cannot enumerate pre-existing Durable Objects. On first UI load with an empty catalog, the former default `demo-acme` object is registered as **Primary workspace**, preserving its real domains and public checks. Other previously hand-entered workspace IDs can be recovered by requesting their domain API once, which adds them to the catalog.
 
 ## Current limitations
 
-- Cloudflare for SaaS provisioning checks are simulations; no production Cloudflare for SaaS API is called.
-- Demo workspace IDs are supplied by the client. Authentication and authorization must be added before production use.
-- Internationalized hostnames are not converted with IDNA; inputs must be ASCII hostnames.
-- There is no cross-workspace aggregate index because Durable Object SQLite is instance-local.
-- Local chat requires Cloudflare authentication because Workers AI inference is remote.
-- Live results are point-in-time observations and may differ across resolvers during propagation.
-- TLS certificate metadata is unavailable through Workers `fetch()`; only handshake success/failure is observed.
-- Live diagnostics cannot reveal internal Cloudflare for SaaS hostname or certificate provisioning state.
+- Authentication and authorization are not implemented; workspace IDs must be bound to authenticated membership before production use.
+- Unicode domains are not converted with IDNA; register ASCII hostnames.
+- Results are point-in-time observations and can differ across resolvers during propagation.
+- TLS certificate metadata is unavailable in the Workers fetch API.
+- Public checks cannot reveal any provider’s internal hostname or certificate lifecycle state.
 
-## Relevant Cloudflare documentation
+See [docs/architecture.md](docs/architecture.md) for component boundaries and migration details.
 
-- [Durable Objects](https://developers.cloudflare.com/durable-objects/)
-- [SQLite-backed Durable Objects](https://developers.cloudflare.com/durable-objects/api/sql-storage/)
-- [Cloudflare Workflows](https://developers.cloudflare.com/workflows/)
-- [Cloudflare for SaaS custom hostnames](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/domain-support/)
-- [Cloudflare for SaaS common API calls](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/start/common-api-calls/)
-- [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
-- [Cloudflare DNS over HTTPS](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/)
-- [Cloudflare Agents](https://developers.cloudflare.com/agents/)
+## Cloudflare documentation
+
+- [Agents](https://developers.cloudflare.com/agents/)
 - [`AIChatAgent` and `useAgentChat`](https://developers.cloudflare.com/agents/communication-channels/chat/chat-agents/)
-- [Llama 3.3 70B Instruct FP8 Fast](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)
+- [Workers AI Llama 3.3 70B](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)
+- [SQLite-backed Durable Objects](https://developers.cloudflare.com/durable-objects/api/sql-storage/)
+- [DNS over HTTPS](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/)
+- [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)

@@ -4,18 +4,14 @@ import { useAgent } from "agents/react";
 import { useState } from "react";
 import type { DomainOpsChatAgent } from "./agent/domain-ops-chat-agent";
 
-export function ChatPanel({ workspaceId }: { workspaceId: string }) {
+export function ChatPanel({ workspaceId, onClose }: { workspaceId: string; onClose(): void }) {
   const [input, setInput] = useState("");
-  const agent = useAgent<DomainOpsChatAgent>({
-    agent: "DomainOpsChatAgent",
-    name: workspaceId,
-  });
-  const { messages, sendMessage, clearHistory, status, stop, isRecovering } = useAgentChat({
+  const agent = useAgent<DomainOpsChatAgent>({ agent: "DomainOpsChatAgent", name: workspaceId });
+  const { messages, sendMessage, clearHistory, status, stop, isRecovering, error } = useAgentChat({
     agent,
-    experimental_throttle: 80,
+    experimental_throttle: 60,
   });
   const busy = status === "submitted" || status === "streaming" || isRecovering;
-
   function submit(event: React.FormEvent) {
     event.preventDefault();
     const text = input.trim();
@@ -23,49 +19,76 @@ export function ChatPanel({ workspaceId }: { workspaceId: string }) {
     sendMessage({ text });
     setInput("");
   }
-
   return (
-    <section className="panel chat-panel">
-      <div className="panel-heading">
+    <section className="chat-panel">
+      <header className="chat-header">
         <div>
-          <span>Persistent AI assistant</span>
+          <p className="eyebrow">AI copilot</p>
           <h2>Domain troubleshooting</h2>
         </div>
-        <button className="text-button" onClick={() => clearHistory()} disabled={busy}>
-          Clear chat
-        </button>
-      </div>
-      <div className="chat-notice">
-        Real Workers AI · read-only tools · simulated onboarding and live observations stay separate
+        <div>
+          <button className="text-button" onClick={() => clearHistory()} disabled={busy}>
+            Clear
+          </button>
+          <button className="drawer-close" onClick={onClose} aria-label="Close copilot">
+            ×
+          </button>
+        </div>
+      </header>
+      <div className="chat-trust">
+        <span>✦</span>
+        <p>
+          Grounded in saved public observations. Ask me to run a new check when you need current
+          data.
+        </p>
       </div>
       <div className="messages" aria-live="polite">
-        {messages.length === 0 ? (
+        {!messages.length ? (
           <div className="chat-empty">
-            <strong>Ask about this workspace</strong>
-            <p>
-              Try “Which domains need attention?” or “Why is incorrect-dns.demo.example not ready?”
-            </p>
+            <div>✦</div>
+            <h3>How can I help?</h3>
+            <p>Ask about a domain’s DNS, HTTPS health, recent changes, or request a live check.</p>
+            <button onClick={() => setInput("Which domains need attention?")}>
+              Which domains need attention?
+            </button>
+            <button onClick={() => setInput("Run a live check for ")}>Run a live check</button>
           </div>
         ) : (
           messages.map((message) => <ChatMessage key={message.id} message={message} />)
         )}
-        {isRecovering ? <div className="chat-status">Recovering the previous response…</div> : null}
+        {status === "submitted" ? (
+          <div className="chat-status">
+            <i />
+            Connecting to diagnostic tools…
+          </div>
+        ) : null}
+        {isRecovering ? (
+          <div className="chat-status">
+            <i />
+            Recovering the response…
+          </div>
+        ) : null}
+        {error ? (
+          <div className="chat-error">
+            The copilot could not complete that response. {error.message}
+          </div>
+        ) : null}
       </div>
       <form className="chat-form" onSubmit={submit}>
         <textarea
           value={input}
           onChange={(event) => setInput(event.target.value)}
-          placeholder="Ask about DNS, SSL, readiness, or validation history…"
+          placeholder="Ask about a domain or request a live check…"
           rows={3}
         />
-        <div className="chat-actions">
-          <small>Conversation history is stored in this workspace's chat Durable Object.</small>
+        <div>
+          <small>Public checks are rate-limited and SSRF-protected.</small>
           {busy ? (
-            <button className="secondary" type="button" onClick={() => stop()}>
+            <button type="button" className="secondary" onClick={() => stop()}>
               Stop
             </button>
           ) : (
-            <button className="primary" disabled={!input.trim()} type="submit">
+            <button className="primary" disabled={!input.trim()}>
               Send
             </button>
           )}
@@ -83,13 +106,33 @@ function ChatMessage({ message }: { message: UIMessage }) {
         {message.parts.map((part, index) => {
           if (part.type === "text") return <p key={index}>{part.text}</p>;
           if (isToolUIPart(part)) {
+            const name = getToolName(part);
             const output = "output" in part ? part.output : undefined;
+            const failed =
+              part.state === "output-error" ||
+              Boolean(
+                output &&
+                typeof output === "object" &&
+                "result" in output &&
+                output.result === "error",
+              );
             return (
-              <details className="tool-call" key={part.toolCallId}>
+              <details
+                className={`tool-call ${failed ? "failed" : ""}`}
+                key={part.toolCallId}
+                open={failed}
+              >
                 <summary>
-                  {getToolName(part)} · {toolStateLabel(part.state)}
+                  <i />
+                  {toolLabel(name, part.state)}
                 </summary>
-                {output === undefined ? null : <pre>{JSON.stringify(output, null, 2)}</pre>}
+                {failed ? (
+                  <p>{toolError(output)}</p>
+                ) : output === undefined ? (
+                  <small>Please wait while the public observation is retrieved.</small>
+                ) : (
+                  <small>Diagnostic evidence received.</small>
+                )}
               </details>
             );
           }
@@ -100,8 +143,26 @@ function ChatMessage({ message }: { message: UIMessage }) {
   );
 }
 
-function toolStateLabel(state: string): string {
-  if (state === "output-available") return "checked";
-  if (state === "output-error") return "failed";
-  return "checking";
+function toolLabel(name: string, state: string) {
+  const labels: Record<string, string> = {
+    listDomains: "Reviewing domain inventory",
+    getDomainStatus: "Reading latest domain health",
+    getDnsConfiguration: "Inspecting public DNS",
+    getDiagnosticHistory: "Reviewing diagnostic history",
+    diagnoseDomain: "Analyzing observed issues",
+    runLiveDiagnostic: "Running public DNS and HTTPS checks",
+  };
+  const verb =
+    state === "output-available" ? "Complete" : state === "output-error" ? "Failed" : "In progress";
+  return `${labels[name] ?? "Using diagnostic tool"} · ${verb}`;
+}
+function toolError(output: unknown) {
+  if (
+    output &&
+    typeof output === "object" &&
+    "message" in output &&
+    typeof output.message === "string"
+  )
+    return output.message;
+  return "The diagnostic tool could not complete this request.";
 }

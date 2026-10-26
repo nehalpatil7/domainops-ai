@@ -2,7 +2,7 @@
   "name": "domainops-ai",
   "version": "0.1.0",
   "private": true,
-  "description": "AI-powered custom domain onboarding and troubleshooting on Cloudflare",
+  "description": "AI-powered public domain troubleshooting on Cloudflare",
   "type": "module",
   "scripts": {
     "build": "vite build",
